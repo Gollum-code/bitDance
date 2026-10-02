@@ -1,9 +1,0 @@
-package com.example.demo.community.mapper;
-
-import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import com.example.demo.community.entity.Post;
-import org.apache.ibatis.annotations.Mapper;
-
-@Mapper
-public interface PostMapper extends BaseMapper<Post> {
-}

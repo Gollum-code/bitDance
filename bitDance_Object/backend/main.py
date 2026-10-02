@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -182,9 +182,104 @@ def user_dto(user: AuthedUser) -> dict[str, Any]:
         "username": user.username,
         "email": user.email,
         "memberTier": user.member_tier,
-        "memberUntil": None if user.member_until is None else time.strftime("%Y-%m-%d", time.gmtime(int(user.member_until))),
+        "memberUntil": None if user.member_until is None else time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(int(user.member_until))),
         "memberActive": user_is_member(user),
     }
+
+
+def iso_time(ts: int | float) -> str:
+    """epoch -> ISO8601（与 Java LocalDateTime 序列化一致，如 2026-10-02T18:00:00）。"""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(int(ts)))
+
+
+# ---- 会员门禁（与 demo Java 版 MembershipService 行为一致） ----
+
+
+def assert_can_use_strategy(user: AuthedUser, strategy_id: str) -> None:
+    """非会员仅允许使用策略列表第一个策略；开通会员可解锁全部。"""
+    if not strategy_id or not strategy_id.strip():
+        raise HTTPException(status_code=400, detail="strategyId 不能为空")
+    if user_is_member(user):
+        return
+    free_id = resolve_free_strategy_id()
+    if not free_id:
+        free_id = "01"
+    if free_id == strategy_id.strip():
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="非会员仅可使用列表中的首个策略，开通会员可解锁其余策略与 AI 问答",
+    )
+
+
+def assert_ai_access(user: AuthedUser) -> None:
+    if not user_is_member(user):
+        raise HTTPException(
+            status_code=403,
+            detail="AI 问答为会员功能，请在会员中心开通会员",
+        )
+
+
+def _forward_json(path: str, payload: dict, method: str = "POST") -> dict:
+    """转发到 trader(8000)。"""
+    import urllib.request
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://localhost:8000{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"回测服务暂不可用: {exc}") from exc
+
+
+_free_id_cache: dict[str, Any] = {"id": None, "at": 0.0}
+
+
+def resolve_free_strategy_id() -> str | None:
+    """取策略列表第一个 id（缓存 60s，与 Java 版一致）。"""
+    now = time.time()
+    cached = _free_id_cache["id"]
+    if cached and now - _free_id_cache["at"] < 60:
+        return cached
+    try:
+        raw = _forward_json("/strategy/list", {}, method="GET")
+    except Exception:
+        return cached
+    strategies = raw.get("strategies") or []
+    if not strategies:
+        return cached
+    first = strategies[0]
+    sid = str(first.get("strategy_id", "")).strip() or None
+    if sid:
+        _free_id_cache["id"] = sid
+        _free_id_cache["at"] = now
+    return sid
+
+
+def annotate_strategies(raw: dict, user: AuthedUser | None) -> dict:
+    """给策略列表打会员锁定标记（与 Java 版 annotateStrategies 一致）。"""
+    if raw is None:
+        return {}
+    member = user is not None and user_is_member(user)
+    strategies = raw.get("strategies") or []
+    if strategies:
+        free_id = None
+        for row in strategies:
+            sid = str(row.get("strategy_id", "")).strip()
+            if free_id is None:
+                free_id = sid or None
+            row["locked"] = (not member) and (sid != free_id)
+        raw["freeStrategyId"] = free_id
+    raw["memberActive"] = member
+    return raw
 
 
 def normalize_account(account: str) -> str:
@@ -337,24 +432,38 @@ def _forward_chat(path: str, payload: dict) -> dict:
 
 
 @app.post("/api/chat/send")
-def chat_send(body: ChatRequest):
-    result = _forward_chat("/chat/completions", {"message": body.message})
+def chat_send(body: ChatRequest, user: AuthedUser = Depends(get_current_user)):
+    assert_ai_access(user)
+    result = _forward_chat("/chat/completions", {"conversation_id": body.conversation_id or "", "message": body.message})
     return {"success": True, "reply": result.get("reply", ""), "conversationId": result.get("conversation_id", "")}
 
 
+@app.post("/api/chat/send-with-id")
+def chat_send_with_id(body: ChatRequest, user: AuthedUser = Depends(get_current_user)):
+    assert_ai_access(user)
+    result = _forward_chat("/chat/completions", {"conversation_id": body.conversation_id or "", "message": body.message})
+    return {
+        "conversationId": result.get("conversation_id", ""),
+        "reply": result.get("reply", ""),
+        "model": result.get("model"),
+        "usage": result.get("usage"),
+    }
+
+
 @app.post("/api/chat/new")
-def chat_new(body: ChatRequest):
+def chat_new(body: ChatRequest, user: AuthedUser = Depends(get_current_user)):
+    assert_ai_access(user)
     result = _forward_chat("/chat/completions", {"message": body.message})
     return {"success": True, "reply": result.get("reply", ""), "conversationId": result.get("conversation_id", "")}
 
 
 @app.post("/api/chat/clear")
-def chat_clear(body: ChatRequest):
-    return {"success": True}
+def chat_clear(body: ChatRequest, user: AuthedUser = Depends(get_current_user)):
+    return {"success": True, "message": "会话已清空"}
 
 
 @app.get("/api/chat/status")
-def chat_status():
+def chat_status(user: AuthedUser = Depends(get_current_user)):
     return {"hasActiveConversation": False, "conversationId": ""}
 
 
@@ -377,6 +486,85 @@ def membership_upgrade(user: AuthedUser = Depends(get_current_user)):
     return user_dto(upgraded)
 
 
+# ---- backtest：转发 trader(8000) 真实回测，非会员仅放行首个策略 ----
+
+
+class BacktestRunBody(BaseModel):
+    strategyId: Optional[str] = None
+    strategy_id: Optional[str] = None
+    vtSymbol: str = "600031.SSE"
+    vt_symbol: Optional[str] = None
+    start: str = "2024-01-01"
+    end: Optional[str] = None
+    rate: float = 0.0003
+    slippage: float = 0.01
+    size: float = 1.0
+    pricetick: float = 0.01
+    capital: int = 10000
+    fastWindow: Optional[int] = None
+    slowWindow: Optional[int] = None
+    signalWindow: Optional[int] = None
+    atrWindow: Optional[int] = None
+    atrMult: Optional[float] = None
+    fixedSize: Optional[int] = None
+
+
+def _build_strategy_query(payload: dict) -> str:
+    """把 camelCase 请求体转成 8000 chooseStrategy 的 query 参数。"""
+    q: dict[str, str] = {}
+    sid = payload.get("strategyId") or payload.get("strategy_id")
+    if sid:
+        q["strategy_id"] = str(sid)
+    symbol = payload.get("vtSymbol") or payload.get("vt_symbol")
+    if symbol:
+        q["vt_symbol"] = str(symbol)
+    q["start"] = str(payload.get("start", "2024-01-01"))
+    q["end"] = str(payload.get("end") or max(payload.get("start", "2024-01-01"), "2024-01-01"))
+    for src, dst in [
+        ("rate", "rate"), ("slippage", "slippage"), ("size", "size"),
+        ("pricetick", "pricetick"), ("capital", "capital"),
+    ]:
+        if payload.get(src) is not None:
+            q[dst] = str(payload[src])
+    for src, dst in [
+        ("fastWindow", "fast_window"), ("slowWindow", "slow_window"),
+        ("signalWindow", "signal_window"), ("atrWindow", "atr_window"),
+        ("atrMult", "atr_mult"), ("fixedSize", "fixed_size"),
+    ]:
+        if payload.get(src) is not None:
+            q[dst] = str(payload[src])
+    import urllib.parse
+
+    return urllib.parse.urlencode(q)
+
+
+@app.get("/api/backtest/strategies")
+def backtest_strategies(user: Optional[AuthedUser] = Depends(get_current_user)):
+    raw = _forward_json("/strategy/list", {}, method="GET")
+    return annotate_strategies(raw, user)
+
+
+@app.get("/api/backtest/run")
+@app.get("/api/backtest/run-symbol")
+@app.get("/api/backtest/run-range")
+@app.get("/api/backtest/run-custom")
+def backtest_run(strategy_id: str = "", user: AuthedUser = Depends(get_current_user)):
+    assert_can_use_strategy(user, strategy_id)
+    q = _build_strategy_query({"strategyId": strategy_id, "start": "2024-01-01", "end": ""})
+    return _forward_json(f"/strategy/{strategy_id}?{q}", {}, method="GET")
+
+
+@app.post("/api/backtest/run")
+def backtest_run_post(payload: BacktestRunBody, user: AuthedUser = Depends(get_current_user)):
+    body = payload.model_dump()
+    sid = body.get("strategyId") or body.get("strategy_id")
+    if not sid:
+        raise HTTPException(status_code=400, detail="strategyId 不能为空")
+    assert_can_use_strategy(user, str(sid))
+    q = _build_strategy_query(body)
+    return _forward_json(f"/strategy/{sid}?{q}", {}, method="GET")
+
+
 # ---- community（帖子 / 点赞 / 评论） ----
 
 
@@ -390,8 +578,6 @@ class CommentCreateBody(BaseModel):
 
 
 def _post_summary(row: Any, like_count: int, comment_count: int, liked_by_me: bool = False) -> dict[str, Any]:
-    import time as _t
-
     return {
         "id": int(row["id"]),
         "title": str(row["title"]),
@@ -399,7 +585,7 @@ def _post_summary(row: Any, like_count: int, comment_count: int, liked_by_me: bo
         "authorUsername": str(row["username"]),
         "likeCount": like_count,
         "commentCount": comment_count,
-        "createdAt": _t.strftime("%Y-%m-%d %H:%M", _t.localtime(int(row["created_at"]))),
+        "createdAt": iso_time(int(row["created_at"])),
         "likedByMe": liked_by_me,
     }
 
@@ -507,7 +693,7 @@ def community_create_post(body: PostCreateBody, user: AuthedUser = Depends(get_c
             "likeCount": 0,
             "commentCount": 0,
             "likedByMe": False,
-            "createdAt": time.strftime("%Y-%m-%d %H:%M", time.localtime()),
+            "createdAt": iso_time(time.time()),
         }
     finally:
         conn.close()
@@ -561,7 +747,7 @@ def community_comments(post_id: int, sort: str = "new", user: Optional[AuthedUse
                 "authorUsername": str(r["username"]),
                 "likeCount": int(r["like_count"]),
                 "likedByMe": liked,
-                "createdAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(int(r["created_at"]))),
+                "createdAt": iso_time(int(r["created_at"])),
             })
         return result
     finally:
@@ -586,7 +772,7 @@ def community_create_comment(post_id: int, body: CommentCreateBody, user: Authed
             "authorUsername": user.username,
             "likeCount": 0,
             "likedByMe": False,
-            "createdAt": time.strftime("%Y-%m-%d %H:%M", time.localtime()),
+            "createdAt": iso_time(time.time()),
         }
     finally:
         conn.close()
@@ -611,4 +797,31 @@ def community_toggle_comment_like(comment_id: int, user: AuthedUser = Depends(ge
         return {"liked": liked is None, "likeCount": int(count)}
     finally:
         conn.close()
+
+
+# ---- tushare 行情 CSV 上传：转发到 trader(8000) ----
+
+
+@app.post("/api/tusharestaticsupload/upload/csv")
+async def tushare_upload_csv(file: UploadFile = File(...)):
+    import urllib.request
+
+    content = await file.read()
+    boundary = "----bitdance" + str(int(time.time() * 1000))
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{file.filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8") + content + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            "http://localhost:8000/upload/csv",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"上传转发失败: {exc}") from exc
 

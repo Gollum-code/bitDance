@@ -57,12 +57,14 @@ bitDance/
 
 #### 后端
 
-- 基于 FastAPI + SQLite
-- 提供认证接口：
-  - `POST /api/auth/register`
-  - `POST /api/auth/login`
-  - `GET /api/auth/me`
-- 数据库默认文件：`bitDance_Object/backend/data/app.db`
+- 基于 FastAPI + SQLite（数据库默认文件 `bitDance_Object/backend/data/app.db`）
+- 提供完整业务 API：
+  - 认证：`POST /api/auth/register`、`POST /api/auth/login`、`GET /api/auth/me`
+  - 会员：`POST /api/membership/upgrade-demo`（演示开通，非会员仅放行首个策略与限制 AI 问答）
+  - 社区：帖子/点赞/评论（`/api/community/*`）
+  - 回测：`/api/backtest/*`（转发 trader 8000 真实 vn.py 回测引擎，带会员门禁）
+  - 聊天：`/api/chat/*`（转发 trader 8000 Kimi 对话，会员专用）
+  - 行情 CSV 上传：`/api/tusharestaticsupload/upload/csv`
 
 ### 3) 回测示例与策略改写
 
