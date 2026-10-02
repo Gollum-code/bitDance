@@ -1,0 +1,21 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:testdb;MODE=MySQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always
+      schema-locations:
+        - classpath:db/schema-users.sql
+        - classpath:db/schema-community.sql
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+
+bitdance:
+  jwt:
+    secret: "test-secret-test-secret-test-secret-test-secret"
+    expires-seconds: 3600
