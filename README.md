@@ -85,6 +85,25 @@ bitDance/
 
 > 建议使用 Python 3.10+ 与 Node.js 18+。
 
+### 一键启动（推荐）
+
+Windows 下在仓库根目录执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start-all.ps1
+```
+
+脚本会自动：
+1. 检查并安装前端依赖（`npm install`）
+2. 启动后端服务（`bitDance_Object/backend`，端口 8080）
+3. 启动 trader 服务（`trader/main.py`，端口 8000）
+4. 启动前端 Vite（端口 5173）
+5. 健康检查并打印各服务地址
+
+启动完成后打开 `http://localhost:5173` 即可。
+
+### 手动分步启动
+
 ### A. 启动 `bitDance_Object` 后端（8080）
 
 在 `bitDance_Object/backend` 目录执行：
