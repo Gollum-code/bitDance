@@ -1,4 +1,10 @@
-"""行情：TuShare 拉取 A 股列表与日线，可选同步到 vn.py 本地库供回测引擎读取。"""
+"""行情：优先免费数据源（腾讯公开接口，免 token），可选 TuShare。
+
+数据源选择（环境变量 DATA_SOURCE）：
+  free      默认。腾讯公开接口，无需 token/注册，适合 demo 与 GitHub 展示。
+  tushare   需要设置 TUSHARE_TOKEN（付费/积分）。
+免费源实现见 routers.free_market。
+"""
 
 from __future__ import annotations
 
@@ -7,22 +13,24 @@ import time
 from typing import Any
 
 import pandas as pd
-import tushare as ts
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from routers.free_market import fetch_daily as free_daily, fetch_stock_list as free_list
 from routers.tushare_bars import bars_from_tushare_daily_df, save_bars_to_database
 
 router = APIRouter()
 
-# TuShare 配置：通过环境变量注入（避免把真实 token / 私有网关提交到仓库）。
-#   TUSHARE_TOKEN       TuShare 官方 token（可选；配置后直连官方接口）
-#   TUSHARE_HTTP_URL    自建/镜像网关地址（可选；配置后覆盖默认官方地址）
+# TuShare 配置（可选）：通过环境变量注入，避免把真实 token / 私有网关提交到仓库。
 _DEFAULT_TOKEN = ""
 _DEFAULT_HTTP_URL = ""
 
 _stocks_cache: dict[str, Any] = {"df": None, "loaded_at": 0.0}
 _STOCKS_TTL_SEC = 3600
+
+
+def _data_source() -> str:
+    return os.environ.get("DATA_SOURCE", "free").strip().lower()
 
 
 def _token() -> str:
@@ -38,9 +46,13 @@ def _http_url() -> str | None:
 
 
 def get_pro():
+    if _data_source() != "tushare":
+        raise RuntimeError("当前数据源为 free（腾讯公开接口），无需 TuShare token")
     token = _token()
     if not token:
         raise RuntimeError("未配置 TuShare：请设置环境变量 TUSHARE_TOKEN")
+    import tushare as ts
+
     pro = ts.pro_api(token)
     url = _http_url()
     if url:
@@ -60,6 +72,18 @@ def ts_code_to_vt_symbol(ts_code: str) -> str:
     return f"{code}.{suf}"
 
 
+def _to_tx_code(ts_code: str) -> str:
+    """600000.SH -> sh600000（腾讯代码格式）"""
+    from routers.free_market import vt_to_tx
+
+    return vt_to_tx(ts_code_to_vt_symbol(ts_code))
+
+
+def _fmt_ymd(yyyymmdd: str) -> str:
+    """20240101 -> 2024-01-01"""
+    return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+
+
 def _normalize_yyyymmdd(d: str) -> str:
     s = d.strip().replace("-", "")
     if len(s) != 8 or not s.isdigit():
@@ -73,17 +97,25 @@ class SyncVnpyRequest(BaseModel):
     end_date: str = Field(..., description="结束 YYYYMMDD 或 YYYY-MM-DD")
 
 
-def _load_all_listed_stocks(pro) -> pd.DataFrame:
+def _load_all_listed_stocks(pro=None) -> pd.DataFrame:
+    """全市场股票列表。free 源用腾讯公开接口；tushare 用 pro.stock_basic。"""
     now = time.time()
     cached = _stocks_cache["df"]
     loaded_at = float(_stocks_cache["loaded_at"] or 0)
     if cached is not None and (now - loaded_at) < _STOCKS_TTL_SEC:
         return cached
 
-    df = pro.stock_basic(
-        list_status="L",
-        fields="ts_code,symbol,name,area,industry,list_date",
-    )
+    if _data_source() == "tushare":
+        df = pro.stock_basic(
+            list_status="L",
+            fields="ts_code,symbol,name,area,industry,list_date",
+        )
+        if df is not None and not df.empty:
+            df = df.copy()
+            df["symbol"] = df["ts_code"].str.split(".").str[0]
+    else:
+        df = free_list()
+
     if df is None:
         df = pd.DataFrame()
     _stocks_cache["df"] = df
@@ -97,10 +129,9 @@ def search_stocks(
     limit: int = Query(80, ge=1, le=500),
 ):
     try:
-        pro = get_pro()
-        df = _load_all_listed_stocks(pro)
+        df = _load_all_listed_stocks(get_pro() if _data_source() == "tushare" else None)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TuShare stock_basic 失败: {e}") from e
+        raise HTTPException(status_code=502, detail=f"股票列表获取失败: {e}") from e
 
     if df is None or df.empty:
         return {"items": [], "message": "未返回股票基础数据"}
@@ -117,6 +148,10 @@ def search_stocks(
     records = work.to_dict(orient="records")
     for r in records:
         r["vt_symbol"] = ts_code_to_vt_symbol(str(r["ts_code"]))
+        r.setdefault("symbol", str(r["ts_code"]).split(".")[0])
+        r.setdefault("area", "")
+        r.setdefault("industry", "")
+        r.setdefault("list_date", "")
     return {"items": records, "count": len(records)}
 
 
@@ -133,10 +168,15 @@ def get_daily_bars(
         raise HTTPException(status_code=400, detail=str(err)) from err
 
     try:
-        pro = get_pro()
-        df = pro.query("daily", ts_code=ts_code, start_date=s, end_date=e)
+        if _data_source() == "tushare":
+            pro = get_pro()
+            df = pro.query("daily", ts_code=ts_code, start_date=s, end_date=e)
+        else:
+            tx = _to_tx_code(ts_code)
+            df = free_daily(tx, _fmt_ymd(s), _fmt_ymd(e))
     except Exception as ex:
-        raise HTTPException(status_code=502, detail=f"TuShare daily 失败: {ex}") from ex
+        source = "TuShare" if _data_source() == "tushare" else "免费源(腾讯)"
+        raise HTTPException(status_code=502, detail=f"{source} daily 失败: {ex}") from ex
 
     if df is None or df.empty:
         return {
@@ -163,7 +203,7 @@ def get_daily_bars(
                 "low": float(row["low"]),
                 "close": float(row["close"]),
                 "vol": float(row["vol"]),
-                "amount": float(row["amount"]),
+                "amount": float(row.get("amount") or 0),
             }
         )
 
@@ -179,7 +219,7 @@ def get_daily_bars(
 
 @router.post("/sync-vnpy")
 def sync_bars_to_vnpy(body: SyncVnpyRequest):
-    """从 TuShare 拉日线并写入 vn.py 数据库，供 CTA 回测 load_data() 使用。"""
+    """拉日线并写入 vn.py 数据库，供 CTA 回测 load_data() 使用。"""
     ts_code = body.ts_code.strip().upper()
     try:
         s, e = _normalize_yyyymmdd(body.start_date), _normalize_yyyymmdd(body.end_date)
@@ -187,10 +227,15 @@ def sync_bars_to_vnpy(body: SyncVnpyRequest):
         raise HTTPException(status_code=400, detail=str(err)) from err
 
     try:
-        pro = get_pro()
-        df = pro.query("daily", ts_code=ts_code, start_date=s, end_date=e)
+        if _data_source() == "tushare":
+            pro = get_pro()
+            df = pro.query("daily", ts_code=ts_code, start_date=s, end_date=e)
+        else:
+            tx = _to_tx_code(ts_code)
+            df = free_daily(tx, _fmt_ymd(s), _fmt_ymd(e))
     except Exception as ex:
-        raise HTTPException(status_code=502, detail=f"TuShare daily 失败: {ex}") from ex
+        source = "TuShare" if _data_source() == "tushare" else "免费源(腾讯)"
+        raise HTTPException(status_code=502, detail=f"{source} daily 失败: {ex}") from ex
 
     if df is None or df.empty:
         raise HTTPException(status_code=404, detail="该区间无数据，无法同步")

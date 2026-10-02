@@ -14,8 +14,11 @@ from vnpy.trader.utility import ZoneInfo
 def _exchange_from_suffix(suffix: str) -> Exchange:
     exchange_map = {
         "SH": Exchange.SSE,
+        "SSE": Exchange.SSE,
         "SZ": Exchange.SZSE,
+        "SZSE": Exchange.SZSE,
         "BJ": Exchange.BSE,
+        "BSE": Exchange.BSE,
         "CFX": Exchange.CFFEX,
         "SHF": Exchange.SHFE,
         "ZCE": Exchange.CZCE,

@@ -119,6 +119,27 @@ python trader/main.py
 
 启动后默认监听：`http://0.0.0.0:8000`
 
+### D. 数据源（免费 vs TuShare）
+
+`trader/routers/market_data.py` 支持两种行情数据源，通过环境变量 `DATA_SOURCE` 切换：
+
+| 数据源 | 环境变量 | 说明 |
+|--------|---------|------|
+| `free`（默认） | 无需配置 | 腾讯公开行情接口（免 token/注册），股票列表 + 日线前复权，适合 demo 与 GitHub 展示 |
+| `tushare` | `TUSHARE_TOKEN`（必填），可选 `TUSHARE_HTTP_URL` | TuShare Pro（付费/积分），数据更全 |
+
+```bash
+# 默认免费源（无需任何配置）
+python trader/main.py
+
+# 切换到 TuShare（需先在环境里设置 token）
+set DATA_SOURCE=tushare
+set TUSHARE_TOKEN=你的token
+python trader/main.py
+```
+
+免费源实现：`trader/routers/free_market.py`（腾讯 `qt.gtimg.cn` / `web.ifzq.gtimg.cn`，带缓存与限速）。
+
 ## 回测与研究
 
 - 策略研究建议优先通过 Notebook 与脚本进行迭代
