@@ -4,3 +4,5 @@ python-jose[cryptography]
 passlib
 pydantic[email]
 python-multipart
+httpx
+pytest
