@@ -29,7 +29,10 @@ replay_pid*.log
 *.db
 *.mv.db
 *.trace.db
-data/
+# 仅忽略运行期数据目录，不误伤前端 src/data/ 源码
+/data/
+/bitDance_Object/backend/data/
+/trader/.vntrader/
 
 # 打包文件
 *.rar
