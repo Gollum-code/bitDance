@@ -24,6 +24,7 @@ dist-ssr/
 *.log
 hs_err_pid*.log
 replay_pid*.log
+.pytest_cache/
 
 # 数据库 / 临时数据
 *.db
