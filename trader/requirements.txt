@@ -6,3 +6,4 @@ tushare
 pandas
 vnpy
 vnpy_ctastrategy
+python-multipart
