@@ -66,23 +66,21 @@ def tx_to_vt(tx_code: str) -> str:
 
 def _iter_a_share_codes() -> list[str]:
     """
-    生成全市场 A 股代码集合。
-    腾讯没有稳定的"全市场列表"接口，这里按已知板块号段批量生成代码，
-    再通过一次批量实时行情请求过滤出有效（有名称）的标的。
+    生成全市场 A 股代码集合（按实际号段枚举，减少无效请求）。
+    沪市：600/601/603/605/688/689；深市：000/001/002/003/300/301。
+    每个号段覆盖 1000 个即可覆盖实际上市代码（6 位股票代码上限）。
     """
     codes: list[str] = []
-    # 沪市：600/601/603/605/688/689 开头
-    for prefix, count in [("600", 0), ("601", 0), ("603", 0), ("605", 0), ("688", 0), ("689", 0)]:
+    for prefix in ["600", "601", "603", "605", "688", "689"]:
         for i in range(1, 1000):
             codes.append(f"sh{prefix}{i:03d}")
-    # 深市：000/001/002/003/300/301
     for prefix in ["000", "001", "002", "003", "300", "301"]:
         for i in range(1, 1000):
             codes.append(f"sz{prefix}{i:03d}")
     return codes
 
 
-def _fetch_quotes(tx_codes: list[str], batch: int = 60) -> pd.DataFrame:
+def _fetch_quotes(tx_codes: list[str], batch: int = 300) -> pd.DataFrame:
     """批量拉取实时行情，过滤有效标的，返回 ts_code/名称 DataFrame。"""
     records: list[dict[str, str]] = []
     for i in range(0, len(tx_codes), batch):
@@ -106,7 +104,7 @@ def _fetch_quotes(tx_codes: list[str], batch: int = 60) -> pd.DataFrame:
             if not name:  # 无名称 = 代码无效
                 continue
             records.append({"ts_code": tx_to_vt(tx_code), "name": name})
-        time.sleep(0.02)  # 轻微限速，避免被封
+        time.sleep(0.01)  # 轻微限速，避免被封
     return pd.DataFrame(records).drop_duplicates(subset="ts_code")
 
 

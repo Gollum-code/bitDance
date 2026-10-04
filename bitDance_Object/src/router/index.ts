@@ -17,6 +17,12 @@ const router = createRouter({
       meta: { title: '行情' },
     },
     {
+      path: '/dashboard',
+      name: 'dashboard',
+      component: () => import('../views/DashboardView.vue'),
+      meta: { title: '市场看板' },
+    },
+    {
       path: '/market/stock',
       name: 'market-stock',
       component: () => import('../views/MarketStockView.vue'),

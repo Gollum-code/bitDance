@@ -18,6 +18,7 @@ const displayName = computed(() => currentUser.value?.username || '…')
 
 const nav = [
   { label: '首页', to: '/' },
+  { label: '市场看板', to: '/dashboard' },
   { label: '行情', to: '/market' },
   { label: '我的策略', to: '/strategies' },
   { label: '会员中心', to: '/member' },

@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import SiteFooter from '../components/bitdance/SiteFooter.vue'
+import StrategyWorkshop from '../components/bitdance/StrategyWorkshop.vue'
 import { useAuth } from '../state/auth'
 
 const auth = useAuth()
@@ -62,9 +63,15 @@ function guarded(to: string) {
       </header>
 
       <section class="actions" aria-label="功能入口">
+        <RouterLink to="/dashboard" class="card card--primary">
+          <h2>市场看板</h2>
+          <p>真实 A 股行情概览：自选股涨跌、涨跌幅榜与股票搜索，直达个股日线。</p>
+          <span class="card-meta">进入 →</span>
+        </RouterLink>
+
         <RouterLink to="/market" class="card card--primary">
           <h2>行情数据</h2>
-          <p>从 TuShare 拉取 A 股列表与日线 K 线，同步到本地库后一键跳转到策略回测。</p>
+          <p>拉取 A 股列表与日线 K 线（默认免费源，可切 TuShare），同步到本地库后一键跳转到策略回测。</p>
           <span class="card-meta">进入 →</span>
         </RouterLink>
 
@@ -92,6 +99,8 @@ function guarded(to: string) {
           <span class="card-meta">{{ isAuthed ? '进入' : '登录后查看' }} →</span>
         </RouterLink>
       </section>
+
+      <StrategyWorkshop />
 
       <section class="hint" aria-label="AI 入口说明">
         <h2 class="hint-title">AI 与报告</h2>

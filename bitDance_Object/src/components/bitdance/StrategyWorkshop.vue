@@ -1,16 +1,46 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { RouterLink } from 'vue-router'
+import { listStrategies, type StrategyListItem } from '../../services/backtest'
+import { STRATEGY_ARCHETYPE_LABEL, STRATEGY_DISPLAY_NAMES } from '../../data/strategyDisplayNames'
 
-const strategies = [
-  { tier: 'primary', name: '多因子 · 沪深300 增强', meta: '运行中 · 低换手' },
-  { tier: 'secondary', name: 'CTA 趋势跟随', meta: '模拟盘' },
-  { tier: 'tertiary', name: '期权中性对冲', meta: '草稿' },
-  { tier: 'quaternary', name: '网格 · 数字资产', meta: '已暂停' },
-] as const
+const loading = ref(true)
+const errorText = ref('')
+const strategies = ref<StrategyListItem[]>([])
+
+// 按 archetype 归类（族名 -> 中文标签 -> 数量），展示真实的策略谱系
+const families = computed(() => {
+  const groups = new Map<string, { label: string; items: StrategyListItem[] }>()
+  for (const it of strategies.value) {
+    const arch = it.archetype || 'other'
+    const label = STRATEGY_ARCHETYPE_LABEL[arch] ?? arch
+    if (!groups.has(arch)) groups.set(arch, { label, items: [] })
+    groups.get(arch)!.items.push(it)
+  }
+  return [...groups.entries()]
+    .map(([key, g]) => ({ key, label: g.label, count: g.items.length, items: g.items }))
+    .sort((a, b) => b.count - a.count)
+})
+
+const tierOf = (idx: number) => ['primary', 'secondary', 'tertiary', 'quaternary'][Math.min(idx, 3)]
+
+function displayName(id: string) {
+  return STRATEGY_DISPLAY_NAMES[id] ?? id
+}
 
 const risk = ref('12')
 const freq = ref('中频')
 const slip = ref('0.8')
+
+onMounted(async () => {
+  try {
+    strategies.value = await listStrategies()
+  } catch (e) {
+    errorText.value = e instanceof Error ? e.message : '策略列表加载失败'
+  } finally {
+    loading.value = false
+  }
+})
 </script>
 
 <template>
@@ -19,12 +49,28 @@ const slip = ref('0.8')
       <h2 id="workshop-title" class="sr-only">策略工作台</h2>
       <div class="timeline">
         <p class="eyebrow">策略谱系</p>
-        <ul class="stack">
-          <li v-for="s in strategies" :key="s.name" :class="['row', s.tier]">
-            <span class="name">{{ s.name }}</span>
-            <span class="meta">{{ s.meta }}</span>
+        <p v-if="loading" class="meta">策略加载中…</p>
+        <p v-else-if="errorText" class="meta">未登录无法加载策略：{{ errorText }}</p>
+        <ul v-else class="stack">
+          <li
+            v-for="(f, i) in families"
+            :key="f.key"
+            :class="['row', tierOf(i)]"
+          >
+            <span class="name">
+              {{ f.label }}
+              <span class="count">{{ f.count }} 个策略</span>
+            </span>
+            <span class="meta">
+              包含：
+              <template v-for="(it, k) in f.items.slice(0, 3)" :key="it.strategy_id">
+                {{ k > 0 ? '、' : '' }}{{ displayName(it.strategy_id) }}
+              </template>
+              <template v-if="f.items.length > 3"> 等 {{ f.items.length }} 个</template>
+            </span>
           </li>
         </ul>
+        <RouterLink to="/strategies" class="enter-link">进入策略工作台 →</RouterLink>
       </div>
 
       <div class="config">
@@ -123,6 +169,26 @@ const slip = ref('0.8')
 .meta {
   font-size: 0.75rem;
   color: rgba(168, 162, 158, 0.55);
+  line-height: 1.5;
+}
+
+.count {
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: rgba(191, 147, 83, 0.75);
+  margin-left: 0.35rem;
+}
+
+.enter-link {
+  display: inline-block;
+  margin-top: 0.9rem;
+  font-size: 0.8125rem;
+  color: rgba(191, 147, 83, 0.92);
+  text-decoration: none;
+}
+
+.enter-link:hover {
+  text-decoration: underline;
 }
 
 .primary .name {
