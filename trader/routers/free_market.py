@@ -34,8 +34,17 @@ _LIST_TTL_SEC = 3600
 
 def _http_get(url: str, timeout: int = 15, encoding: str = "utf-8") -> str:
     req = urllib.request.Request(url, headers=_UA)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode(encoding, errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode(encoding, errors="replace")
+    except urllib.error.HTTPError as e:
+        # 腾讯对高频请求会返回 501/424，转成带状态的异常便于上层降级
+        body = ""
+        try:
+            body = e.read().decode(encoding, errors="replace")[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {e.reason} {body}") from e
 
 
 def vt_to_tx(vt_symbol: str) -> str:
@@ -81,8 +90,12 @@ def _iter_a_share_codes() -> list[str]:
 
 
 def _fetch_quotes(tx_codes: list[str], batch: int = 300) -> pd.DataFrame:
-    """批量拉取实时行情，过滤有效标的，返回 ts_code/名称 DataFrame。"""
-    records: list[dict[str, str]] = []
+    """批量拉取实时行情，过滤有效标的。
+
+    返回字段：ts_code, name（基础），以及当接口给出完整字段时的
+    now/open/high/low/prev_close/change/change_pct/volume/amount/bid/ask/bid1/ask1 等。
+    """
+    records: list[dict[str, Any]] = []
     for i in range(0, len(tx_codes), batch):
         chunk = tx_codes[i: i + batch]
         url = "https://qt.gtimg.cn/q=" + ",".join(chunk)
@@ -97,13 +110,43 @@ def _fetch_quotes(tx_codes: list[str], batch: int = 300) -> pd.DataFrame:
             if not m:
                 continue
             tx_code = m.group(1)
-            fields = m.group(2).split("~")
-            if len(fields) < 3:
+            f = m.group(2).split("~")
+            if len(f) < 3:
                 continue
-            name = fields[1].strip()
-            if not name:  # 无名称 = 代码无效
+            name = f[1].strip()
+            if not name:
                 continue
-            records.append({"ts_code": tx_to_vt(tx_code), "name": name})
+            try:
+                now = float(f[3])
+                prev_close = float(f[4]) if len(f) > 4 else now
+            except (ValueError, IndexError):
+                now = prev_close = 0.0
+            change = now - prev_close if prev_close else 0.0
+            change_pct = (change / prev_close * 100.0) if prev_close else 0.0
+
+            def _num(idx: int, default: float = 0.0) -> float:
+                try:
+                    return float(f[idx])
+                except (ValueError, IndexError):
+                    return default
+
+            records.append({
+                "ts_code": tx_to_vt(tx_code),
+                "name": name,
+                "now": now,
+                "open": _num(5),
+                "high": _num(33),
+                "low": _num(34),
+                "prev_close": prev_close,
+                "change": round(change, 3),
+                "change_pct": round(change_pct, 3),
+                "volume": _num(6),      # 手
+                "amount": _num(37),     # 万元
+                "bid": _num(9),
+                "ask": _num(19),
+                "bid_volume": _num(10),
+                "ask_volume": _num(20),
+            })
         time.sleep(0.01)  # 轻微限速，避免被封
     return pd.DataFrame(records).drop_duplicates(subset="ts_code")
 

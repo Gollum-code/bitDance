@@ -1,0 +1,531 @@
+"""分析类路由：多策略对比 / 因子选股 / 参数网格优化 / 实时行情推送。
+
+复用现有回测引擎（examples.cta_backtesting.run_rewritten_strategy_backtest）
+与免费行情源（routers.free_market），不重复造轮子。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from fastapi import APIRouter, HTTPException, Query, WebSocket
+from pydantic import BaseModel, Field
+
+from examples.cta_backtesting.run_rewritten_strategy_backtest import (
+    DEFAULT_CONFIG,
+    build_setting,
+    load_strategy_class,
+)
+from routers.free_market import fetch_daily as free_daily
+from routers.free_market import fetch_stock_list as free_list
+from routers.market_data import ts_code_to_vt_symbol
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+MAX_COMPARE = 8
+MAX_GRID_CELLS = 60
+_grid_cache: dict[str, Any] = {}
+_executor_pool: ThreadPoolExecutor | None = None
+
+
+def _executor() -> ThreadPoolExecutor:
+    global _executor_pool
+    if _executor_pool is None:
+        _executor_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="analytics")
+    return _executor_pool
+
+
+def _safe(v: Any) -> Any:
+    """把 numpy / date 类型转成 JSON 可序列化的原生类型。"""
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, (date, pd.Timestamp)):
+        return v.isoformat()
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+
+def _run_backtest(sid: str, cfg: dict) -> dict:
+    """执行单策略回测，返回 stats + series(权益曲线) + 交易数。不抛异常，失败用 ok=False。"""
+    import sys as _sys
+
+    from vnpy.trader.constant import Interval
+    from vnpy_ctastrategy.backtesting import BacktestingEngine
+    from examples.cta_backtesting.run_rewritten_strategy_backtest import parse_date
+
+    # 确保 rewritten_strategies 包可导入（与 run_rewritten_strategy_backtest 相同做法）
+    script_dir = Path(__file__).resolve().parent.parent / "examples" / "cta_backtesting"
+    if str(script_dir) not in _sys.path:
+        _sys.path.insert(0, str(script_dir))
+
+    sid = sid.zfill(2)
+    try:
+        strategy_cls, row = load_strategy_class(sid)
+    except Exception as e:
+        return {"ok": False, "strategy_id": sid, "error": f"策略加载失败: {e}"}
+
+    engine = BacktestingEngine()
+    engine.set_parameters(
+        vt_symbol=cfg["vt_symbol"],
+        interval=Interval.DAILY,
+        start=parse_date(cfg["start"]),
+        end=parse_date(cfg["end"]),
+        rate=cfg.get("rate", DEFAULT_CONFIG["rate"]),
+        slippage=cfg.get("slippage", DEFAULT_CONFIG["slippage"]),
+        size=cfg.get("size", DEFAULT_CONFIG["size"]),
+        pricetick=cfg.get("pricetick", DEFAULT_CONFIG["pricetick"]),
+        capital=cfg.get("capital", DEFAULT_CONFIG["capital"]),
+    )
+    overrides = {k: cfg.get(k) for k in ("fast_window", "slow_window", "signal_window", "atr_window", "atr_mult", "fixed_size")}
+    setting = build_setting(strategy_cls, row, overrides)
+    engine.add_strategy(strategy_cls, setting)
+    engine.load_data()
+    if not engine.history_data:
+        return {"ok": False, "strategy_id": sid, "class_name": row["class_name"], "error": "本地库无该标的日线数据，请先同步"}
+
+    engine.run_backtesting()
+    result_df = engine.calculate_result()
+    stats = engine.calculate_statistics()
+
+    series = {"dates": [], "balance": []}
+    if result_df is not None and not result_df.empty:
+        series["dates"] = [i.strftime("%Y-%m-%d") if hasattr(i, "strftime") else str(i) for i in result_df.index]
+        if "balance" in result_df.columns:
+            series["balance"] = [float(v) for v in result_df["balance"].fillna(0).tolist()]
+
+    # 归一化为百分比收益，便于多策略叠加对比
+    norm = []
+    if series["balance"] and series["balance"][0] > 0:
+        base = series["balance"][0]
+        norm = [round((b / base - 1) * 100, 4) for b in series["balance"]]
+
+    return {
+        "ok": True,
+        "strategy_id": sid,
+        "class_name": row["class_name"],
+        "archetype": row["archetype"],
+        "stats": {k: _safe(v) for k, v in stats.items()},
+        "trade_count": len(engine.trades),
+        "series": {"dates": series["dates"], "returns": norm},
+    }
+
+
+# ---- 多策略对比 ----
+
+
+class CompareRequest(BaseModel):
+    strategy_ids: list[str] = Field(..., description="策略 id 列表，1-8 个")
+    vt_symbol: str = Field("600519.SSE", description="vn.py 标的，如 600519.SSE")
+    start: str = "2024-01-01"
+    end: str | None = None
+
+
+@router.post("/compare")
+def compare_strategies(body: CompareRequest):
+    """同一标的、同一区间跑多个策略，输出收益曲线 + 统计对比。"""
+    ids = [str(s).zfill(2) for s in body.strategy_ids][:MAX_COMPARE]
+    if not ids:
+        raise HTTPException(status_code=400, detail="strategy_ids 不能为空")
+    end = body.end or date.today().isoformat()
+    cfg_base = {"vt_symbol": body.vt_symbol, "start": body.start, "end": end}
+
+    pool = _executor()
+    futures = {pool.submit(_run_backtest, sid, cfg_base): sid for sid in ids}
+    results = []
+    for fut in futures:
+        try:
+            results.append(fut.result(timeout=300))
+        except Exception as e:
+            logger.exception("对比回测失败")
+            results.append({"ok": False, "error": str(e)})
+
+    ok_results = [r for r in results if r.get("ok")]
+    # 统一日期轴（取最长序列，其余按日期对齐）
+    all_dates = sorted({d for r in ok_results for d in r["series"]["dates"]})
+    aligned = {}
+    date_index = {d: i for i, d in enumerate(all_dates)}
+    for r in ok_results:
+        s = r["series"]
+        arr = [None] * len(all_dates)
+        for d, v in zip(s["dates"], s["returns"]):
+            if d in date_index:
+                arr[date_index[d]] = v
+        aligned[r["strategy_id"]] = arr
+
+    return {
+        "success": len(ok_results) > 0,
+        "vt_symbol": body.vt_symbol,
+        "start": body.start,
+        "end": end,
+        "dates": all_dates,
+        "curves": aligned,
+        "results": results,
+        "message": f"成功 {len(ok_results)}/{len(ids)} 个策略" if ok_results else "全部策略回测失败，请确认已同步行情数据",
+    }
+
+
+# ---- 因子选股 ----
+
+
+class ScreenRequest(BaseModel):
+    universe_limit: int = Field(120, ge=10, le=400, description="参与打分的股票数量上限")
+    top_n: int = Field(20, ge=5, le=100)
+    lookback_days: int = Field(120, ge=40, le=400)
+    end_date: str | None = None
+
+
+def _load_daily_df(vt_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """按 免费源 → 本地 vn.py 库 顺序取日线，返回 TuShare 兼容列 DataFrame。"""
+    from routers.free_market import vt_to_tx
+
+    tx = vt_to_tx(vt_code)
+    # 1) 免费腾讯接口
+    for attempt in (0, 1):
+        try:
+            df = free_daily(tx, start_date, end_date)
+            if df is not None and len(df) >= 30:
+                return df
+        except Exception:
+            if attempt == 0:
+                time.sleep(1.0)
+            else:
+                break
+    # 2) 本地 vn.py 数据库兜底（免费源不可用/数据不足时）
+    try:
+        from vnpy.trader.constant import Exchange, Interval
+        from vnpy.trader.database import get_database
+
+        code, _, suf = vt_code.partition(".")
+        suf = suf.upper()
+        exchange = {"SSE": Exchange.SSE, "SZSE": Exchange.SZSE, "BSE": Exchange.BSE}.get(suf)
+        if exchange is None:
+            return pd.DataFrame()
+        bars = get_database().load_bar_data(code, exchange, Interval.DAILY, start_date, end_date)
+        if not bars:
+            return pd.DataFrame()
+        records = [
+            {
+                "ts_code": vt_code,
+                "trade_date": bar.datetime.strftime("%Y%m%d"),
+                "open": bar.open_price,
+                "high": bar.high_price,
+                "low": bar.low_price,
+                "close": bar.close_price,
+                "vol": float(bar.volume),
+                "amount": 0.0,
+            }
+            for bar in bars
+        ]
+        df = pd.DataFrame(records)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _compute_factors(vt_code: str, lookback: int, end_date: str) -> dict | None:
+    """抓单只日线，算多因子原始值。vt_code 形如 600519.SSE。返回 None 表示数据不足。"""
+    from routers.free_market import vt_to_tx
+
+    tx = vt_to_tx(vt_code)
+    raw = vt_code
+
+    end_d = pd.Timestamp(end_date) if end_date else pd.Timestamp.today().normalize()
+    start_d = (end_d - pd.Timedelta(days=int(lookback * 2.2))).strftime("%Y-%m-%d")
+
+    df = _load_daily_df(vt_code, start_d, end_d.strftime("%Y-%m-%d"))
+    if df is None or len(df) < max(30, lookback // 2):
+        return None
+
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    close = df["close"].astype(float).to_numpy()
+    high = df["high"].astype(float).to_numpy()
+    low = df["low"].astype(float).to_numpy()
+    vol = df.get("vol")
+    vol = vol.astype(float).to_numpy() if vol is not None else np.zeros(len(df))
+
+    n = min(lookback, len(close))
+    c, h, l, v = close[-n:], high[-n:], low[-n:], vol[-n:]
+    if len(c) < 30 or c[0] <= 0:
+        return None
+
+    # 各因子（原始值，后面统一做横截面 rank 打分）
+    mom = c[-1] / c[0] - 1.0                                        # 动量（区间涨幅）
+    ma20 = c[-20:].mean()
+    ma60 = c[-60:].mean() if len(c) >= 60 else ma20
+    ma_bias = c[-1] / ma20 - 1.0                                    # 短期偏离（均值回复为负向）
+    trend = c[-1] / ma60 - 1.0                                      # 中期趋势
+    rets = np.diff(c) / c[:-1]
+    vola = float(np.std(rets[-60:]) * math.sqrt(252)) if len(rets) >= 20 else float(np.std(rets) * math.sqrt(252))
+    v_ma = v[-20:].mean()
+    vol_ratio = (v[-5:].mean() / v_ma) if v_ma > 0 else 1.0         # 量能放大
+    amihud = float(np.mean(np.abs(rets[-20:]) / (v[-20:] + 1e-9))) if len(rets) >= 20 else 0.0  # 流动性/冲击
+    hi60, lo60 = float(np.max(h[-60:])), float(np.min(l[-60:])) if len(c) >= 60 else (float(np.max(h)), float(np.min(l)))
+    dd = c[-1] / hi60 - 1.0 if hi60 > 0 else 0.0                     # 距60日高点回撤
+    ma_cross = float(1.0 if ma20 > ma60 else (-1.0 if ma20 < ma60 else 0.0))
+
+    return {
+        "ts_code": raw,
+        "close": float(c[-1]),
+        "mom": mom, "trend": trend, "ma_bias": ma_bias, "volatility": vola,
+        "vol_ratio": vol_ratio, "amihud": amihud, "drawdown_from_high": dd, "ma_cross": float(ma_cross),
+        "_n": len(c),
+    }
+
+
+@router.post("/screen")
+def screen_stocks(body: ScreenRequest):
+    """多因子打分选股：全市场取样 → 计算因子 → 横截面 rank 加权 → Top N。"""
+    end_date = body.end_date or date.today().isoformat()
+    try:
+        stocks = free_list()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"获取股票列表失败: {e}") from e
+    if stocks is None or stocks.empty:
+        raise HTTPException(status_code=502, detail="股票列表为空")
+
+    # 取样：从全市场均匀抽样，控制请求量
+    pool = stocks.head(body.universe_limit * 3) if len(stocks) > body.universe_limit * 3 else stocks
+    from routers.free_market import vt_to_tx
+
+    vt_codes = []
+    for _, r in pool.iterrows():
+        code = str(r.get("ts_code", "")).upper()
+        if not code or "." not in code:
+            continue
+        try:
+            vt_codes.append((vt_to_tx(code), code, str(r.get("name", ""))))
+        except Exception:
+            continue
+    vt_codes = vt_codes[: body.universe_limit]
+
+    # 腾讯接口对并发连接限流（返回 HTTP 424），这里串行抓取并加小间隔
+    rows = []
+    for vt, code, name in vt_codes:
+        try:
+            f = _compute_factors(code, body.lookback_days, end_date)
+        except Exception:
+            f = None
+        if f:
+            f["name"] = name
+            rows.append(f)
+        time.sleep(0.05)
+
+    if len(rows) < 5:
+        return {"success": False, "items": [], "message": f"仅 {len(rows)} 只股票数据充足，无法打分（请稍后重试或减少 lookback）"}
+
+    df = pd.DataFrame(rows)
+
+    # 因子方向：越大越好 vs 越小越好
+    positive = ["mom", "trend", "vol_ratio", "ma_cross"]
+    negative = ["volatility", "amihud", "drawdown_from_high", "ma_bias"]
+    weights = {
+        "mom": 0.25, "trend": 0.20, "vol_ratio": 0.10, "ma_cross": 0.10,
+        "volatility": 0.15, "amihud": 0.10, "drawdown_from_high": 0.10, "ma_bias": 0.10,
+    }
+
+    score = pd.Series(0.0, index=df.index)
+    for col in positive + negative:
+        pct = df[col].rank(pct=True)
+        score = score + (pct if col in positive else (1 - pct)) * weights.get(col, 0.0)
+    df["score"] = score * 100
+
+    top = df.sort_values("score", ascending=False).head(body.top_n)
+    items = []
+    for _, r in top.iterrows():
+        items.append({
+            "ts_code": r["ts_code"],
+            "vt_symbol": ts_code_to_vt_symbol(str(r["ts_code"])),
+            "name": r["name"],
+            "close": _safe(r["close"]),
+            "score": round(float(r["score"]), 2),
+            "factors": {
+                "mom": round(float(r["mom"]) * 100, 2),
+                "trend": round(float(r["trend"]) * 100, 2),
+                "volatility": round(float(r["volatility"]) * 100, 2),
+                "vol_ratio": round(float(r["vol_ratio"]), 2),
+                "drawdown_from_high": round(float(r["drawdown_from_high"]) * 100, 2),
+            },
+        })
+
+    return {
+        "success": True,
+        "universe": len(df),
+        "scanned": len(vt_codes),
+        "lookback_days": body.lookback_days,
+        "items": items,
+        "factors_used": list(weights.keys()),
+        "message": f"从 {len(df)} 只数据充足标的中选出 Top {len(items)}",
+    }
+
+
+# ---- 参数网格优化 ----
+
+
+class GridRequest(BaseModel):
+    strategy_id: str
+    param_name: str = Field("fast_window", description="要扫描的参数名（策略 parameters 之一）")
+    values: list[float] = Field(..., description="参数取值列表，如 [5,10,15,20]")
+    fixed_params: dict[str, float] | None = Field(None, description="其他固定参数")
+    vt_symbol: str = "600519.SSE"
+    start: str = "2024-01-01"
+    end: str | None = None
+    capital: int = 10_000
+
+
+@router.post("/grid")
+def grid_optimize(body: GridRequest):
+    """参数网格扫描：对一个参数的多组取值批量回测，输出收益/回撤矩阵（热力图数据）。"""
+    values = [float(v) for v in body.values][:12]
+    if len(values) < 2:
+        raise HTTPException(status_code=400, detail="至少提供 2 个参数取值")
+    if len(values) * 1 > MAX_GRID_CELLS:
+        values = values[:MAX_GRID_CELLS]
+
+    sid = str(body.strategy_id).zfill(2)
+    end = body.end or date.today().isoformat()
+    cfg_base = {"vt_symbol": body.vt_symbol, "start": body.start, "end": end, "capital": body.capital}
+    if body.fixed_params:
+        cfg_base.update(body.fixed_params)
+
+    cache_key = json.dumps({"sid": sid, "p": body.param_name, "v": values, "c": cfg_base}, sort_keys=True)
+    cached = _grid_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 1800:
+        return {**cached["data"], "cached": True}
+
+    pool = _executor()
+    futures = {}
+    for v in values:
+        cfg = dict(cfg_base)
+        cfg[body.param_name] = (int(v) if v.is_integer() else v)
+        futures[pool.submit(_run_backtest, sid, cfg)] = v
+
+    cells = []
+    best_class = None
+    for fut, v in futures.items():
+        try:
+            r = fut.result(timeout=300)
+        except Exception as e:
+            r = {"ok": False, "error": str(e)}
+        if r.get("ok"):
+            st = r.get("stats", {})
+            best_class = r.get("class_name")
+            total_return = st.get("total_return")
+            dd = st.get("max_drawdown")
+            cells.append({
+                "value": v,
+                "ok": True,
+                "total_return": round(float(total_return), 3) if isinstance(total_return, (int, float)) else None,
+                "annual_return": _safe(st.get("annual_return")),
+                "max_drawdown": round(float(dd), 3) if isinstance(dd, (int, float)) else None,
+                "sharpe": _safe(st.get("sharpe_ratio")),
+                "trade_count": r.get("trade_count", 0),
+            })
+        else:
+            cells.append({"value": v, "ok": False, "error": r.get("error", "回测失败")})
+
+    best = None
+    ok_cells = [c for c in cells if c["ok"] and c.get("total_return") is not None]
+    if ok_cells:
+        best = max(ok_cells, key=lambda c: c["total_return"])
+
+    data = {
+        "success": len(ok_cells) > 0,
+        "strategy_id": sid,
+        "class_name": best_class,
+        "param_name": body.param_name,
+        "vt_symbol": body.vt_symbol,
+        "start": body.start,
+        "end": end,
+        "cells": sorted(cells, key=lambda c: c["value"]),
+        "best": best,
+        "message": f"扫描 {len(cells)} 组参数" + (f"，最佳 {body.param_name}={best['value']}（总收益 {best['total_return']}%）" if best else "（无有效结果）"),
+    }
+    _grid_cache[cache_key] = {"ts": time.time(), "data": data}
+    return data
+
+
+# ---- 实时行情 WebSocket ----
+
+_watch_subs: set[str] = set()
+
+
+class WatchRequest(BaseModel):
+    symbols: list[str] = Field(..., description="腾讯代码，如 sh600519")
+
+
+@router.get("/realtime")
+def realtime_quotes(symbols: str = Query("sh600519", description="逗号分隔的腾讯代码")):
+    """拉取实时快照（REST，供 WS 不可用时降级）。"""
+    from routers.free_market import _fetch_quotes
+
+    codes = [s.strip() for s in symbols.split(",") if s.strip()][:60]
+    if not codes:
+        raise HTTPException(status_code=400, detail="symbols 不能为空")
+    try:
+        df = _fetch_quotes(codes)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"实时行情获取失败: {e}") from e
+    if df is None or df.empty:
+        return {"items": [], "message": "无数据"}
+    records = df.to_dict(orient="records")
+    return {"items": records, "count": len(records)}
+
+
+@router.websocket("/ws")
+async def realtime_ws(websocket: WebSocket):
+    """WebSocket 实时推送：客户端连上后每 3 秒推送一次快照。"""
+    await websocket.accept()
+    logger.info("WS connected")
+    try:
+        symbols: list[str] = []
+        while True:
+            try:
+                msg = await asyncio.wait_for(websocket.receive_json(), timeout=3.0)
+                if isinstance(msg, dict) and "symbols" in msg:
+                    symbols = [str(s).strip() for s in msg["symbols"] if str(s).strip()][:60]
+                    logger.info("WS subscribed: %s", symbols[:5])
+            except asyncio.TimeoutError:
+                pass
+
+            if symbols:
+                try:
+                    payload = await asyncio.get_running_loop().run_in_executor(
+                        _executor(), lambda: _snapshot(symbols)
+                    )
+                except Exception as e:
+                    logger.exception("WS snapshot error")
+                    payload = {"items": [], "error": str(e)}
+                await websocket.send_json(payload)
+            else:
+                await websocket.send_json({"items": [], "message": "等待订阅 symbols"})
+            await asyncio.sleep(3)
+    except Exception as e:
+        logger.warning("WS closed: %r", e)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+def _snapshot(symbols: list[str]) -> dict:
+    from routers.free_market import _fetch_quotes
+
+    try:
+        df = _fetch_quotes(symbols)
+    except Exception as e:
+        return {"items": [], "error": str(e)}
+    if df is None or df.empty:
+        return {"items": [], "message": "无数据"}
+    return {"items": df.to_dict(orient="records"), "count": len(df), "ts": int(time.time() * 1000)}

@@ -82,6 +82,30 @@ const router = createRouter({
       component: () => import('../views/DocsView.vue'),
       meta: { title: '文档中心' },
     },
+    {
+      path: '/analytics/compare',
+      name: 'strategy-compare',
+      component: () => import('../views/StrategyCompareView.vue'),
+      meta: { title: '多策略对比' },
+    },
+    {
+      path: '/analytics/screen',
+      name: 'factor-screener',
+      component: () => import('../views/FactorScreenerView.vue'),
+      meta: { title: '因子选股' },
+    },
+    {
+      path: '/analytics/grid',
+      name: 'grid-optimize',
+      component: () => import('../views/GridOptimizeView.vue'),
+      meta: { title: '参数优化' },
+    },
+    {
+      path: '/analytics/realtime',
+      name: 'realtime',
+      component: () => import('../views/RealtimeView.vue'),
+      meta: { title: '实时行情' },
+    },
   ],
   scrollBehavior(to, _from, saved) {
     if (saved) return saved

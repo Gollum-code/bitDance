@@ -11,8 +11,9 @@ from pathlib import Path
 import pytest
 
 os.environ.setdefault("BITDANCE_JWT_SECRET", "test-secret")
-# 测试使用独立临时数据库，避免污染开发数据（必须在 import main 之前设置）
-os.environ["BITDANCE_DB_PATH"] = str(Path(tempfile.gettempdir()) / "bitdance_ci_test.db")
+# 测试使用独立临时数据库（每会话唯一，避免残留数据），必须在 import main 之前设置
+_tmpdb = Path(tempfile.mkdtemp(prefix="bitdance_ci_")) / "app.db"
+os.environ["BITDANCE_DB_PATH"] = str(_tmpdb)
 # main.py 在 backend/ 下（tests 的上一级）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

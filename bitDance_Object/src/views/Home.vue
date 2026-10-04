@@ -95,8 +95,32 @@ function guarded(to: string) {
 
         <RouterLink :to="guarded('/report-history')" class="card">
           <h2>回测历史报告</h2>
-          <p>查看 AI 生成的回测报告历史，支持导出 PDF；报告按账号保存在本机浏览器。</p>
+          <p>查看 AI 生成的回测报告历史，支持导出 PDF；报告按账号保存在本机浏览器中。</p>
           <span class="card-meta">{{ isAuthed ? '进入' : '登录后查看' }} →</span>
+        </RouterLink>
+
+        <RouterLink to="/analytics/compare" class="card">
+          <h2>多策略对比</h2>
+          <p>同一标的、同一区间并行回测多个策略，收益曲线叠加 + 指标并排。</p>
+          <span class="card-meta">进入 →</span>
+        </RouterLink>
+
+        <RouterLink to="/analytics/screen" class="card">
+          <h2>因子选股器</h2>
+          <p>免费全市场行情 · 动量/趋势/波动/量能/回撤多因子横截面打分 · Top N。</p>
+          <span class="card-meta">进入 →</span>
+        </RouterLink>
+
+        <RouterLink to="/analytics/grid" class="card">
+          <h2>参数网格优化</h2>
+          <p>对单个策略参数做网格扫描，观察收益 / 回撤随参数取值的变化。</p>
+          <span class="card-meta">进入 →</span>
+        </RouterLink>
+
+        <RouterLink to="/analytics/realtime" class="card">
+          <h2>实时行情推送</h2>
+          <p>WebSocket 每 3 秒推送腾讯实时快照，展示你自选标的的最新行情。</p>
+          <span class="card-meta">进入 →</span>
         </RouterLink>
       </section>
 

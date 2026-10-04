@@ -26,12 +26,22 @@ const nav = [
   { label: '社区', to: '/community' },
 ] as const
 
+const toolNav = [
+  { label: '策略对比', to: '/analytics/compare' },
+  { label: '因子选股', to: '/analytics/screen' },
+  { label: '参数优化', to: '/analytics/grid' },
+  { label: '实时行情', to: '/analytics/realtime' },
+] as const
+
 function isActive(path: string) {
   if (path === '/') return route.path === '/'
   if (path === '/market') return route.path.startsWith('/market')
+  if (path === '/analytics/compare') return route.path.startsWith('/analytics/compare')
+  if (path === '/analytics/screen') return route.path.startsWith('/analytics/screen')
+  if (path === '/analytics/grid') return route.path.startsWith('/analytics/grid')
+  if (path === '/analytics/realtime') return route.path.startsWith('/analytics/realtime')
   return route.path === path
 }
-
 function closeMenu() {
   menuOpen.value = false
 }
@@ -110,6 +120,16 @@ watch(menuOpen, (open) => {
         >
           {{ item.label }}
         </RouterLink>
+        <span class="nav-sep" aria-hidden="true" />
+        <RouterLink
+          v-for="item in toolNav"
+          :key="item.to"
+          :to="item.to"
+          class="nav-link nav-link--tool"
+          :class="{ 'nav-link--on': isActive(item.to) }"
+        >
+          {{ item.label }}
+        </RouterLink>
       </nav>
 
       <div class="actions">
@@ -175,6 +195,17 @@ watch(menuOpen, (open) => {
           <RouterLink
             v-for="item in nav"
             :key="`m-${item.to}`"
+            :to="item.to"
+            class="sheet-link"
+            :class="{ 'sheet-link--on': isActive(item.to) }"
+            @click="closeMenu"
+          >
+            {{ item.label }}
+          </RouterLink>
+          <p class="sheet-group">分析工具</p>
+          <RouterLink
+            v-for="item in toolNav"
+            :key="`t-${item.to}`"
             :to="item.to"
             class="sheet-link"
             :class="{ 'sheet-link--on': isActive(item.to) }"
@@ -311,6 +342,18 @@ watch(menuOpen, (open) => {
 
 .nav-link--on {
   color: var(--bq-accent-soft);
+}
+
+.nav-sep {
+  align-self: center;
+  width: 1px;
+  height: 1.05rem;
+  background: rgba(255, 255, 255, 0.14);
+  margin: 0 0.15rem;
+}
+
+.nav-link--tool {
+  color: rgba(191, 147, 83, 0.6);
 }
 
 .actions {
@@ -619,6 +662,15 @@ watch(menuOpen, (open) => {
 
 .sheet-link--on {
   color: rgba(198, 153, 96, 0.92);
+}
+
+.sheet-group {
+  margin: 0.85rem 0.5rem 0.15rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: rgba(191, 147, 83, 0.55);
 }
 
 .sheet-enter-active,
