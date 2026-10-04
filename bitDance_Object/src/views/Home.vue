@@ -122,6 +122,12 @@ function guarded(to: string) {
           <p>WebSocket 每 3 秒推送腾讯实时快照，展示你自选标的的最新行情。</p>
           <span class="card-meta">进入 →</span>
         </RouterLink>
+
+        <RouterLink to="/analytics/portfolio" class="card">
+          <h2>组合回测</h2>
+          <p>单个策略在多个标的上等权/加权组合回测，输出组合净值、回撤与夏普。</p>
+          <span class="card-meta">进入 →</span>
+        </RouterLink>
       </section>
 
       <StrategyWorkshop />

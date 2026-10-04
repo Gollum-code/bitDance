@@ -8,9 +8,11 @@ import {
   defaultChartEndDate,
   defaultChartStartDate,
   getMarketDaily,
+  getMarketMinute,
   syncMarketToVnpy,
   uploadCsvToVnpy,
   type DailyPayload,
+  type MinutePayload,
 } from '../services/market'
 
 const route = useRoute()
@@ -28,6 +30,12 @@ const infoMessage = ref('')
 const payload = ref<DailyPayload | null>(null)
 
 const vtSymbol = computed(() => payload.value?.vt_symbol ?? '')
+
+type ViewMode = 'daily' | 'minute'
+const viewMode = ref<ViewMode>('daily')
+const minutePeriod = ref('m5')
+const minutePayload = ref<MinutePayload | null>(null)
+const minuteLoading = ref(false)
 
 const chartOption = computed<EChartsOption>(() => {
   const bars = payload.value?.bars ?? []
@@ -129,6 +137,98 @@ const chartOption = computed<EChartsOption>(() => {
     ],
   }
 })
+
+const minuteOption = computed<EChartsOption>(() => {
+  const bars = minutePayload.value?.bars ?? []
+  if (bars.length === 0) {
+    return {
+      backgroundColor: 'transparent',
+      title: { text: '暂无分时数据', left: 'center', top: 'middle', textStyle: { color: '#7f8ea3', fontSize: 13 } },
+    }
+  }
+  const times = bars.map((b) => b.datetime.slice(11, 16))
+  const closes = bars.map((b) => b.close)
+  const vols = bars.map((b) => b.vol)
+  const base = closes[0] || 1
+  return {
+    backgroundColor: 'transparent',
+    animation: false,
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'cross' },
+      backgroundColor: 'rgba(6, 12, 23, 0.95)',
+      borderColor: 'rgba(129, 156, 193, 0.35)',
+      textStyle: { color: '#dbe8ff', fontSize: 12 },
+    },
+    legend: { top: 4, data: ['分时价', '成交量'], textStyle: { color: '#c7d5ea', fontSize: 12 } },
+    grid: [
+      { left: '8%', right: '4%', top: '14%', height: '56%' },
+      { left: '8%', right: '4%', top: '76%', height: '14%' },
+    ],
+    xAxis: [
+      {
+        type: 'category',
+        data: times,
+        axisLine: { lineStyle: { color: 'rgba(143, 162, 194, .45)' } },
+        axisLabel: { color: '#90a2bf', hideOverlap: true },
+        splitLine: { show: false },
+      },
+      { type: 'category', gridIndex: 1, data: times, axisLabel: { show: false }, splitLine: { show: false } },
+    ],
+    yAxis: [
+      {
+        scale: true,
+        axisLabel: { color: '#9ab0ce', formatter: (v: number) => `${v.toFixed(2)}` },
+        splitLine: { lineStyle: { color: 'rgba(103, 126, 162, .22)' } },
+      },
+      {
+        gridIndex: 1,
+        splitNumber: 2,
+        axisLabel: { color: '#9ab0ce', formatter: (v: number) => (v >= 1e8 ? `${(v / 1e8).toFixed(1)}亿` : `${(v / 1e4).toFixed(0)}万`) },
+        axisLine: { lineStyle: { color: 'rgba(143, 162, 194, .45)' } },
+        splitLine: { lineStyle: { color: 'rgba(103, 126, 162, .22)' } },
+      },
+    ],
+    dataZoom: [{ type: 'inside', xAxisIndex: [0, 1], start: 0, end: 100 }],
+    series: [
+      {
+        name: '分时价',
+        type: 'line',
+        data: closes,
+        smooth: true,
+        showSymbol: false,
+        lineStyle: { color: '#5aa9ff', width: 1.6 },
+        areaStyle: { color: 'rgba(90, 169, 255, 0.12)' },
+        markLine: {
+          symbol: 'none',
+          data: [{ yAxis: base }],
+          lineStyle: { color: 'rgba(240, 180, 41, 0.5)', type: 'dashed' },
+        },
+      },
+      { name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: vols, itemStyle: { color: 'rgba(90, 169, 255, 0.45)' } },
+    ],
+  }
+})
+
+async function loadMinute() {
+  if (!tsCode.value) return
+  minuteLoading.value = true
+  try {
+    minutePayload.value = await getMarketMinute(tsCode.value, minutePeriod.value, 320)
+  } catch (e) {
+    minutePayload.value = null
+    errorMessage.value = e instanceof Error ? e.message : '分时加载失败'
+  } finally {
+    minuteLoading.value = false
+  }
+}
+
+async function switchView(mode: ViewMode) {
+  viewMode.value = mode
+  if (mode === 'minute' && !minutePayload.value && tsCode.value) {
+    await loadMinute()
+  }
+}
 
 async function loadDaily() {
   if (!tsCode.value) return
@@ -280,8 +380,38 @@ watch([start, end], () => {
         请先「同步」再回测，否则本地库可能没有该标的日线数据；也可导入本地 CSV 日线文件（ts_code,trade_date,open,high,low,close,vol,amount）。
       </p>
 
-      <div class="chart-wrap">
+      <div class="tabs">
+        <button
+          type="button"
+          class="tab"
+          :class="{ on: viewMode === 'daily' }"
+          @click="switchView('daily')"
+        >
+          日线 K 线
+        </button>
+        <button
+          type="button"
+          class="tab"
+          :class="{ on: viewMode === 'minute' }"
+          @click="switchView('minute')"
+        >
+          分时
+          <select v-model="minutePeriod" class="period" @click.stop @change="loadMinute">
+            <option value="m1">1分</option>
+            <option value="m5">5分</option>
+            <option value="m15">15分</option>
+            <option value="m30">30分</option>
+            <option value="m60">60分</option>
+          </select>
+        </button>
+        <span v-if="viewMode === 'minute' && minuteLoading" class="muted">加载中…</span>
+      </div>
+
+      <div v-if="viewMode === 'daily'" class="chart-wrap">
         <v-chart class="chart" :option="chartOption" autoresize />
+      </div>
+      <div v-else class="chart-wrap">
+        <v-chart class="chart" :option="minuteOption" autoresize />
       </div>
     </section>
   </div>
@@ -420,6 +550,37 @@ h1 {
   margin: 0.45rem 0 0;
   font-size: 0.72rem;
   color: var(--bq-muted);
+}
+.tabs {
+  margin-top: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border: 1px solid rgba(128, 152, 190, 0.25);
+  border-radius: 999px;
+  padding: 0.32rem 0.8rem;
+  font-size: 0.8rem;
+  background: transparent;
+  color: var(--bq-muted);
+  cursor: pointer;
+}
+.tab.on {
+  border-color: var(--bq-accent, #5aa9ff);
+  color: var(--bq-text);
+  background: rgba(90, 169, 255, 0.1);
+}
+.period {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 0.76rem;
+  cursor: pointer;
 }
 .chart-wrap {
   margin-top: 0.85rem;

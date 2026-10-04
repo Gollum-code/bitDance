@@ -30,6 +30,7 @@ const toolNav = [
   { label: '策略对比', to: '/analytics/compare' },
   { label: '因子选股', to: '/analytics/screen' },
   { label: '参数优化', to: '/analytics/grid' },
+  { label: '组合回测', to: '/analytics/portfolio' },
   { label: '实时行情', to: '/analytics/realtime' },
 ] as const
 
@@ -40,6 +41,7 @@ function isActive(path: string) {
   if (path === '/analytics/screen') return route.path.startsWith('/analytics/screen')
   if (path === '/analytics/grid') return route.path.startsWith('/analytics/grid')
   if (path === '/analytics/realtime') return route.path.startsWith('/analytics/realtime')
+  if (path === '/analytics/portfolio') return route.path.startsWith('/analytics/portfolio')
   return route.path === path
 }
 function closeMenu() {

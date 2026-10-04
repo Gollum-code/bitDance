@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import MarkdownDoc from '../components/bitdance/MarkdownDoc.vue'
 import quickStart from '../content/docs/quick-start.md?raw'
-import workflow from '../content/docs/workflow.md?raw'
+import strategyBacktest from '../content/docs/strategy-backtest.md?raw'
+import analytics from '../content/docs/analytics.md?raw'
+import dataSource from '../content/docs/data-source.md?raw'
 
 type DocItem = {
   id: string
@@ -11,8 +13,10 @@ type DocItem = {
 }
 
 const docs: DocItem[] = [
-  { id: 'quick', title: '快速开始', desc: '3 分钟跑通第一个流程', body: quickStart },
-  { id: 'workflow', title: '画布工作流', desc: '从信号到执行的关键路径', body: workflow },
+  { id: 'quick', title: '快速开始', desc: '一键启动 · 首次数据准备 · 页面导览', body: quickStart },
+  { id: 'strategy', title: '策略与回测', desc: '23 个策略族 · 回测 · AI 报告与对比', body: strategyBacktest },
+  { id: 'analytics', title: '分析工具', desc: '多策略对比 / 因子选股 / 参数优化 / 组合回测 / 实时行情', body: analytics },
+  { id: 'datasource', title: '数据源与行情', desc: '免费源 vs TuShare · 行情 API · 限流降级', body: dataSource },
 ]
 </script>
 

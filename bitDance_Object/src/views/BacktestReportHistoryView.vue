@@ -18,8 +18,39 @@ const items = ref<BacktestReportHistoryEntry[]>([])
 const expandedId = ref<string | null>(null)
 const exportingId = ref<string | null>(null)
 const exportError = ref<string | null>(null)
+const compareIds = ref<string[]>([])
+const showCompare = ref(false)
 
 const userId = computed(() => auth.user.value?.id)
+
+const COMPARE_ROWS: { key: string; label: string; fmt: (v: unknown) => string }[] = [
+  { key: 'total_return', label: '总收益率 %', fmt: (v) => fmtNum(v, 2) },
+  { key: 'annual_return', label: '年化收益 %', fmt: (v) => fmtNum(v, 2) },
+  { key: 'max_drawdown', label: '最大回撤 %', fmt: (v) => fmtNum(v, 2) },
+  { key: 'sharpe_ratio', label: '夏普比率', fmt: (v) => fmtNum(v, 2) },
+  { key: 'win_rate', label: '胜率 %', fmt: (v) => fmtNum(v, 2) },
+  { key: 'total_trade_count', label: '成交笔数', fmt: (v) => fmtNum(v, 0) },
+]
+
+function fmtNum(v: unknown, digits: number) {
+  const n = typeof v === 'number' ? v : Number(v)
+  if (v === undefined || v === null || Number.isNaN(n)) return '—'
+  return n.toFixed(digits)
+}
+
+function compareItems() {
+  return compareIds.value.map((id) => items.value.find((i) => i.id === id)).filter(Boolean) as BacktestReportHistoryEntry[]
+}
+
+function toggleCompare(id: string) {
+  const i = compareIds.value.indexOf(id)
+  if (i >= 0) compareIds.value.splice(i, 1)
+  else if (compareIds.value.length < 4) compareIds.value.push(id)
+}
+
+function statsOf(item: BacktestReportHistoryEntry, key: string) {
+  return item.stats?.[key]
+}
 
 function load() {
   const uid = userId.value
@@ -102,6 +133,45 @@ onMounted(() => {
 
     <p v-if="exportError" class="export-error" role="alert">{{ exportError }}</p>
 
+    <section v-if="compareIds.length > 1" class="compare">
+      <div class="compare-head">
+        <h2>对比（{{ compareIds.length }}）</h2>
+        <button type="button" class="cmp-clear" @click="compareIds = []">清空</button>
+        <button
+          type="button"
+          class="cmp-close"
+          :aria-label="showCompare ? '收起对比' : '展开对比'"
+          @click="showCompare = !showCompare"
+        >
+          {{ showCompare ? '收起' : '展开' }}
+        </button>
+      </div>
+      <div v-if="showCompare" class="compare-body">
+        <div class="table-wrap">
+          <table class="cmp-tbl">
+            <thead>
+              <tr>
+                <th class="left">指标</th>
+                <th v-for="it in compareItems()" :key="it.id">
+                  {{ new Date(it.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in COMPARE_ROWS" :key="row.key">
+                <td class="left">{{ row.label }}</td>
+                <td v-for="it in compareItems()" :key="it.id">
+                  <span v-if="statsOf(it, row.key) !== undefined">{{ row.fmt(statsOf(it, row.key)) }}</span>
+                  <span v-else class="dash">—</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="cmp-tip">仅较新的报告包含结构化指标（生成报告时会随回测结果保存）。</p>
+      </div>
+    </section>
+
     <section v-if="items.length === 0" class="empty">
       <p>暂无记录。请先在「我的策略」运行回测，再在右下角 AI 面板中点击「生成回测报告」。</p>
       <RouterLink to="/strategies" class="btn-primary">去我的策略</RouterLink>
@@ -110,9 +180,20 @@ onMounted(() => {
     <ul v-else class="list">
       <li v-for="item in items" :key="item.id" class="card">
         <div class="card-top">
-          <time class="time" :datetime="new Date(item.createdAt).toISOString()">{{
-            formatTime(item.createdAt)
-          }}</time>
+          <div class="card-left">
+            <label class="cmp-check" :title="'加入对比'">
+              <input
+                type="checkbox"
+                :checked="compareIds.includes(item.id)"
+                :disabled="compareIds.length >= 4 && !compareIds.includes(item.id)"
+                @change="toggleCompare(item.id)"
+              />
+              对比
+            </label>
+            <time class="time" :datetime="new Date(item.createdAt).toISOString()">{{
+              formatTime(item.createdAt)
+            }}</time>
+          </div>
           <div class="card-actions">
             <button
               type="button"

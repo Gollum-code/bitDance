@@ -529,3 +529,176 @@ def _snapshot(symbols: list[str]) -> dict:
     if df is None or df.empty:
         return {"items": [], "message": "无数据"}
     return {"items": df.to_dict(orient="records"), "count": len(df), "ts": int(time.time() * 1000)}
+
+
+# ---- 组合回测（Portfolio） ----
+
+
+class PortfolioRequest(BaseModel):
+    strategy_id: str = Field(..., description="策略 id")
+    vt_symbols: list[str] = Field(..., description="组合标的列表，2-10 个")
+    weights: list[float] | None = Field(None, description="等权重时可省略")
+    start: str = "2024-01-01"
+    end: str | None = None
+    capital: int = 100_000
+    rate: float = 0.0003
+    slippage: float = 0.01
+    pricetick: float = 0.01
+    size: float = 1
+    fixed_params: dict[str, float] | None = None
+
+
+@router.post("/portfolio")
+def portfolio_backtest(body: PortfolioRequest):
+    """组合回测：同一策略在多标的上分别出信号，等权/自定义权重分配资金。
+
+    说明：项目策略族基于 vn.py CtaTemplate，这里做组合回测采用「信号照搬」方案——
+    每个标的独立运行该策略，用目标仓位驱动组合引擎，得到组合净值/回撤。
+    """
+    import sys as _sys
+
+    symbols = [str(s) for s in body.vt_symbols if str(s).strip()]
+    if len(symbols) < 2:
+        raise HTTPException(status_code=400, detail="组合至少需要 2 个标的")
+    symbols = symbols[:10]
+
+    weights = body.weights
+    if weights is None:
+        weights = [1.0 / len(symbols)] * len(symbols)
+    if len(weights) != len(symbols):
+        raise HTTPException(status_code=400, detail="weights 长度必须与 vt_symbols 一致")
+    total_w = sum(float(w) for w in weights)
+    if total_w <= 0:
+        raise HTTPException(status_code=400, detail="权重之和必须为正")
+    weights = [float(w) / total_w for w in weights]  # 归一化
+
+    sid = str(body.strategy_id).zfill(2)
+    end = body.end or date.today().isoformat()
+
+    # 每个标的跑一次单策略回测，取 balance 序列 → 等权/加权拼组合净值
+    from datetime import datetime
+
+    from examples.cta_backtesting.run_rewritten_strategy_backtest import parse_date
+
+    script_dir = Path(__file__).resolve().parent.parent / "examples" / "cta_backtesting"
+    if str(script_dir) not in _sys.path:
+        _sys.path.insert(0, str(script_dir))
+
+    pool = _executor()
+    cfg_base = {
+        "vt_symbol": None,
+        "start": body.start,
+        "end": end,
+        "rate": body.rate,
+        "slippage": body.slippage,
+        "size": body.size,
+        "pricetick": body.pricetick,
+        "capital": body.capital,
+    }
+    if body.fixed_params:
+        cfg_base.update(body.fixed_params)
+
+    futures = {pool.submit(_run_backtest, sid, {**cfg_base, "vt_symbol": s}): s for s in symbols}
+
+    # 收集每个标的的日收益序列，按日期对齐后加权合成组合净值
+    date_rets: dict[str, dict[str, float]] = {}
+    symbol_class = None
+    per_symbol = []
+    for fut, s in futures.items():
+        try:
+            r = fut.result(timeout=300)
+        except Exception as e:
+            r = {"ok": False, "error": str(e)}
+        if not r.get("ok"):
+            per_symbol.append({"vt_symbol": s, "ok": False, "error": r.get("error", "回测失败")})
+            continue
+        symbol_class = r.get("class_name")
+        series = r["series"]
+        rets = series.get("returns") or []
+        if not rets or len(rets) != len(series["dates"]):
+            per_symbol.append({"vt_symbol": s, "ok": False, "error": "无成交记录，无法生成组合收益"})
+            continue
+        # returns 是区间累计收益%（起点 0），转日收益序列
+        srets: dict[str, float] = {}
+        prev = None
+        for d, cum in zip(series["dates"], rets):
+            if cum is None:
+                continue
+            if prev is None:
+                srets[d] = 0.0
+            else:
+                srets[d] = (cum / 100.0 + 1.0) / (prev / 100.0 + 1.0) - 1.0
+            prev = cum
+        date_rets[s] = srets
+        per_symbol.append(
+            {
+                "vt_symbol": s,
+                "ok": True,
+                "class_name": r.get("class_name"),
+                "total_return": round(float(r["stats"].get("total_return", 0) or 0), 3),
+                "trade_count": r.get("trade_count", 0),
+            }
+        )
+
+    if not date_rets:
+        return {
+            "success": False,
+            "strategy_id": sid,
+            "message": "组合中所有标的回测失败，请确认已同步行情数据",
+            "per_symbol": per_symbol,
+        }
+
+    all_dates = sorted({d for srets in date_rets.values() for d in srets})
+    comb_ret: dict[str, float] = {}
+    for d in all_dates:
+        acc = 0.0
+        for s, srets in date_rets.items():
+            idx = symbols.index(s)
+            acc += float(weights[idx]) * srets.get(d, 0.0)
+        comb_ret[d] = acc
+
+    nav = 1.0
+    navs: list[float] = []
+    for d in all_dates:
+        nav *= 1.0 + comb_ret.get(d, 0.0)
+        navs.append(round(nav, 6))
+
+    peak = 1.0
+    max_dd = 0.0
+    for n in navs:
+        peak = max(peak, n)
+        dd = n / peak - 1.0
+        max_dd = min(max_dd, dd)
+
+    returns = comb_ret
+    avg = sum(returns.values()) / len(returns) if returns else 0.0
+    std = (sum((r - avg) ** 2 for r in returns.values()) / max(1, len(returns) - 1)) ** 0.5
+    sharpe = (avg / std * 252 ** 0.5) if std > 0 else 0.0
+    total_ret = navs[-1] - 1.0 if navs else 0.0
+
+    # 各标的权重展示
+    weight_info = [
+        {"vt_symbol": s, "weight": round(float(w), 4)}
+        for s, w in zip(symbols, weights)
+    ]
+
+    return {
+        "success": True,
+        "strategy_id": sid,
+        "class_name": symbol_class,
+        "vt_symbols": symbols,
+        "weights": weight_info,
+        "start": body.start,
+        "end": end,
+        "dates": all_dates,
+        "nav": navs,
+        "stats": {
+            "total_return": round(total_ret * 100, 3),
+            "annual_return": round(((1 + total_ret) ** (252 / max(1, len(all_dates))) - 1) * 100, 3),
+            "max_drawdown": round(max_dd * 100, 3),
+            "sharpe_ratio": round(float(sharpe), 3),
+            "total_trade_count": sum(p.get("trade_count", 0) for p in per_symbol if p.get("ok")),
+        },
+        "per_symbol": per_symbol,
+        "message": f"组合回测完成：{len(date_rets)}/{len(symbols)} 个标的有数据，加权净值 {round(total_ret * 100, 2)}%",
+    }

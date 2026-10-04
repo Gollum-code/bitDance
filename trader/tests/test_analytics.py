@@ -89,10 +89,13 @@ def test_vt_tx_code_conversion_in_factor(monkeypatch):
         ("/analytics/screen", {"POST"}),
         ("/analytics/grid", {"POST"}),
         ("/analytics/realtime", {"GET"}),
+        ("/analytics/portfolio", {"POST"}),
+        ("/api/market/minute", {"GET"}),
+        ("/api/market/sync-batch", {"POST"}),
     ],
 )
 def test_routes_registered(path, methods):
-    """4 个分析端点都应注册在 app 的 openapi 中。"""
+    """分析端点与行情新端点都应注册在 app 的 openapi 中。"""
     from fastapi import FastAPI
     from main import app as trader_app  # noqa: F401
 

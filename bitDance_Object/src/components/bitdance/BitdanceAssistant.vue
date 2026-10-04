@@ -169,7 +169,15 @@ async function send(message: string, options?: { showThinking?: boolean; reportU
       auth.user.value?.id != null &&
       !replyText.includes('模型没有返回内容')
     ) {
-      appendBacktestReport(auth.user.value.id, replyText)
+      const lastResult = getLastBacktestResult()
+      const meta =
+        lastResult && lastResult.success && lastResult.stats
+          ? {
+              stats: lastResult.stats as Record<string, number | string | null>,
+              params: (lastResult.params ?? {}) as Record<string, unknown>,
+            }
+          : undefined
+      appendBacktestReport(auth.user.value.id, replyText, meta)
     }
   } catch (error) {
     const text = error instanceof Error ? error.message : '调用服务失败'

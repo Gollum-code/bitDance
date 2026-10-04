@@ -215,4 +215,15 @@ onMounted(async () => {
 .tbl { width: 100%; border-collapse: collapse; font-size: .82rem; }
 .tbl th, .tbl td { padding: .45rem .6rem; border-bottom: 1px solid rgba(255,255,255,.06); color: var(--bq-text); text-align: right; white-space: nowrap; }
 .bestrow { background: rgba(34,197,94,.08); }
+
+@media (max-width: 640px) {
+  .page { padding: 5rem 0.7rem 2.5rem; }
+  .fld { flex: 1 1 100%; }
+  .fld input, .fld select { width: 100%; }
+  .controls .btn { flex: 1 1 100%; justify-content: center; }
+  .bar-row { grid-template-columns: 1fr 44px 44px 40px; }
+  .bar-label { grid-column: 1 / -1; text-align: left; }
+  .tbl { font-size: .74rem; }
+  .tbl th, .tbl td { padding: .35rem .4rem; }
+}
 </style>

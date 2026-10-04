@@ -76,6 +76,36 @@ export interface RealtimeQuote {
   [key: string]: unknown
 }
 
+export interface PortfolioSymbolResult {
+  vt_symbol: string
+  ok: boolean
+  error?: string
+  class_name?: string
+  total_return?: number
+  trade_count?: number
+}
+
+export interface PortfolioPayload {
+  success: boolean
+  strategy_id: string
+  class_name?: string | null
+  vt_symbols: string[]
+  weights: { vt_symbol: string; weight: number }[]
+  start: string
+  end: string
+  dates: string[]
+  nav: number[]
+  stats?: {
+    total_return?: number
+    annual_return?: number
+    max_drawdown?: number
+    sharpe_ratio?: number
+    total_trade_count?: number
+  }
+  per_symbol: PortfolioSymbolResult[]
+  message: string
+}
+
 async function readError(res: Response): Promise<string> {
   const raw = await res.text()
   try {
@@ -128,6 +158,18 @@ export function runGrid(body: {
   capital?: number
 }): Promise<GridPayload> {
   return post('/analytics/grid', body)
+}
+
+export function runPortfolio(body: {
+  strategy_id: string
+  vt_symbols: string[]
+  weights?: number[]
+  start?: string
+  end?: string
+  capital?: number
+  fixed_params?: Record<string, number>
+}): Promise<PortfolioPayload> {
+  return post('/analytics/portfolio', body)
 }
 
 export async function getRealtime(symbols: string[]): Promise<{ items: RealtimeQuote[]; count: number }> {

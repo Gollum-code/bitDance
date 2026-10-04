@@ -187,4 +187,12 @@ onUnmounted(disconnect)
 .up { color: #ef4444; }
 .down { color: #22c55e; }
 .muted-cell { padding: 1rem 0; text-align: center; color: var(--bq-muted); font-size: .82rem; }
+
+@media (max-width: 640px) {
+  .page { padding: 5rem 0.7rem 2.5rem; }
+  .head { flex-direction: column; }
+  .controls .btn { flex: 1 1 100%; justify-content: center; }
+  .tbl { font-size: .76rem; }
+  .tbl th, .tbl td { padding: .35rem .4rem; }
+}
 </style>

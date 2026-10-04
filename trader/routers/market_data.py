@@ -10,13 +10,18 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import date
 from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from routers.free_market import fetch_daily as free_daily, fetch_stock_list as free_list
+from routers.free_market import (
+    fetch_daily as free_daily,
+    fetch_minute as free_minute,
+    fetch_stock_list as free_list,
+)
 from routers.tushare_bars import bars_from_tushare_daily_df, save_bars_to_database
 
 router = APIRouter()
@@ -155,6 +160,38 @@ def search_stocks(
     return {"items": records, "count": len(records)}
 
 
+@router.get("/minute")
+def get_minute_bars(
+    ts_code: str = Query(..., description="如 600000.SH"),
+    period: str = Query("m5", description="m1/m5/m15/m30/m60"),
+    count: int = Query(320, ge=1, le=800),
+):
+    """获取分钟 K 线（免费源：腾讯 mkline 接口）。返回 datetime/open/close/high/low/vol。"""
+    ts_code = ts_code.strip().upper()
+    if _data_source() == "tushare":
+        raise HTTPException(status_code=400, detail="分钟线目前仅支持免费源（DATA_SOURCE=free）")
+    try:
+        tx = _to_tx_code(ts_code)
+        df = free_minute(tx, period=period, count=count)
+    except Exception as ex:
+        raise HTTPException(status_code=502, detail=f"分钟线获取失败: {ex}") from ex
+    if df is None or df.empty:
+        return {"ts_code": ts_code, "vt_symbol": ts_code_to_vt_symbol(ts_code), "bars": [], "message": "无分钟线数据"}
+    bars = []
+    for _, row in df.iterrows():
+        bars.append(
+            {
+                "datetime": str(row["datetime"]),
+                "open": float(row["open"]),
+                "close": float(row["close"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "vol": float(row.get("vol", 0) or 0),
+            }
+        )
+    return {"ts_code": ts_code, "vt_symbol": ts_code_to_vt_symbol(ts_code), "bars": bars, "count": len(bars)}
+
+
 @router.get("/daily")
 def get_daily_bars(
     ts_code: str = Query(..., description="如 600000.SH"),
@@ -255,4 +292,76 @@ def sync_bars_to_vnpy(body: SyncVnpyRequest):
         "start_date": s,
         "end_date": e,
         "message": f"已写入 {n} 条日线到本地库，可在「我的策略」用 vt_symbol={ts_code_to_vt_symbol(ts_code)} 回测",
+    }
+
+
+class SyncBatchItem(BaseModel):
+    ts_code: str
+    name: str = ""
+
+
+class SyncBatchRequest(BaseModel):
+    items: list[SyncBatchItem] = Field(..., description="要同步的标的列表")
+    start_date: str = Field("20240101", description="开始 YYYYMMDD")
+    end_date: str | None = None
+    lookback_years: int = Field(2, ge=1, le=5)
+
+
+@router.post("/sync-batch")
+def sync_batch_to_vnpy(body: SyncBatchRequest):
+    """批量拉取日线并写入 vn.py 数据库（供选股结果 → 回测联动）。"""
+    if len(body.items) > 60:
+        raise HTTPException(status_code=400, detail="单次最多同步 60 只")
+
+    end = body.end_date or date.today().strftime("%Y%m%d")
+    s = body.start_date.replace("-", "")
+    if len(s) != 8 or not s.isdigit():
+        raise HTTPException(status_code=400, detail="start_date 格式应为 YYYYMMDD")
+
+    results = []
+    ok_count = 0
+    for item in body.items:
+        ts_code = item.ts_code.strip().upper()
+        if not ts_code or "." not in ts_code:
+            results.append({"ts_code": ts_code, "ok": False, "error": "代码格式无效"})
+            continue
+        try:
+            if _data_source() == "tushare":
+                pro = get_pro()
+                df = pro.query("daily", ts_code=ts_code, start_date=s, end_date=end)
+            else:
+                tx = _to_tx_code(ts_code)
+                df = free_daily(tx, _fmt_ymd(s), _fmt_ymd(end))
+        except Exception as ex:
+            results.append({"ts_code": ts_code, "name": item.name, "ok": False, "error": str(ex)})
+            continue
+
+        if df is None or df.empty:
+            results.append({"ts_code": ts_code, "name": item.name, "ok": False, "error": "无数据"})
+            continue
+
+        df = df.sort_values("trade_date")
+        try:
+            bars = bars_from_tushare_daily_df(df)
+            n = save_bars_to_database(bars)
+            ok_count += 1
+            results.append(
+                {
+                    "ts_code": ts_code,
+                    "name": item.name,
+                    "ok": True,
+                    "imported_count": n,
+                    "vt_symbol": ts_code_to_vt_symbol(ts_code),
+                }
+            )
+        except Exception as ex:
+            results.append({"ts_code": ts_code, "name": item.name, "ok": False, "error": str(ex)})
+        time.sleep(0.15)
+
+    return {
+        "success": ok_count > 0,
+        "total": len(body.items),
+        "ok_count": ok_count,
+        "results": results,
+        "message": f"成功 {ok_count}/{len(body.items)} 只写入本地库",
     }

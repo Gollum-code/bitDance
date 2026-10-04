@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { BarChart3, Play, Loader2, ExternalLink } from 'lucide-vue-next'
+import { BarChart3, Play, Loader2, ExternalLink, Database, FlaskConical } from 'lucide-vue-next'
 import { runScreen, type ScreenItem, type ScreenPayload } from '../services/analytics'
+import { syncBatchToVnpy } from '../services/market'
 
 const router = useRouter()
 
@@ -12,10 +13,15 @@ const lookback = ref(120)
 const loading = ref(false)
 const err = ref('')
 const data = ref<ScreenPayload | null>(null)
+const syncing = ref(false)
+const syncedCodes = ref<string[]>([])
+const syncErr = ref('')
 
 async function run() {
   loading.value = true
   err.value = ''
+  syncedCodes.value = []
+  syncErr.value = ''
   try {
     data.value = await runScreen({
       universe_limit: universe.value,
@@ -28,6 +34,35 @@ async function run() {
   } finally {
     loading.value = false
   }
+}
+
+async function syncAll() {
+  const items = data.value?.items ?? []
+  if (!items.length) return
+  syncing.value = true
+  syncErr.value = ''
+  try {
+    const payload = await syncBatchToVnpy(
+      items.map((it) => ({ ts_code: it.ts_code, name: it.name })),
+    )
+    if (payload.ok_count > 0) {
+      syncedCodes.value = payload.results.filter((r) => r.ok).map((r) => r.ts_code)
+    }
+    if (payload.message) {
+      syncErr.value = payload.message
+    }
+  } catch (e) {
+    syncErr.value = e instanceof Error ? e.message : '批量同步失败'
+  } finally {
+    syncing.value = false
+  }
+}
+
+function goBacktest() {
+  void router.push({
+    path: '/strategies',
+    query: { vtSymbol: '', start: '', end: '', screen: '1' },
+  })
 }
 
 function fmtPct(v: number | undefined) {
@@ -92,7 +127,26 @@ onMounted(() => {
     </section>
 
     <section v-if="data?.success" class="panel">
-      <h2 class="h2">Top {{ data.items.length }}</h2>
+      <div class="syncbar">
+        <h2 class="h2">Top {{ data.items.length }}</h2>
+        <div class="syncbtns">
+          <button class="btn" :disabled="syncing" @click="syncAll">
+            <Loader2 v-if="syncing" class="ic spin" />
+            <Database v-else class="ic" />
+            {{ syncing ? '同步中…' : '批量同步到本地库' }}
+          </button>
+          <button
+            v-if="syncedCodes.length"
+            class="btn primary"
+            @click="goBacktest"
+          >
+            <FlaskConical class="ic" />
+            去回测（已同步 {{ syncedCodes.length }} 只）
+          </button>
+        </div>
+      </div>
+      <p v-if="syncErr" class="err">{{ syncErr }}</p>
+      <p v-if="syncedCodes.length" class="ok">{{ syncedCodes.length }} 只已写入本地库，可去回测</p>
       <div class="table-wrap">
         <table class="tbl">
           <thead>
@@ -148,8 +202,8 @@ onMounted(() => {
 .controls { display: flex; flex-wrap: wrap; gap: .6rem; align-items: end; }
 .fld { display: grid; gap: .25rem; font-size: .78rem; color: var(--bq-muted); }
 .fld input { border: 1px solid rgba(255,255,255,.14); border-radius: .5rem; padding: .45rem .5rem; background: rgba(8,12,21,.7); color: var(--bq-text); width: 90px; }
-.btn { display: inline-flex; align-items: center; gap: .35rem; border: 0; border-radius: 999px; padding: .55rem 1rem; font-size: .85rem; cursor: pointer; }
-.btn.primary { background: #2563eb; color: #fff; }
+.btn { display: inline-flex; align-items: center; gap: .35rem; border: 1px solid rgba(255,255,255,.14); border-radius: 999px; padding: .5rem .9rem; font-size: .82rem; background: transparent; color: var(--bq-text); cursor: pointer; }
+.btn.primary { background: #2563eb; border-color: transparent; color: #fff; }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
 .ic { width: 1rem; height: 1rem; }
 .spin { animation: sp 1s linear infinite; }
@@ -158,6 +212,8 @@ onMounted(() => {
 .ok { margin: .6rem 0 0; color: #4ade80; font-size: .82rem; }
 .hint { margin: .6rem 0 0; font-size: .76rem; color: var(--bq-muted); }
 .h2 { margin: 0 0 .7rem; font-size: .95rem; color: var(--bq-text); }
+.syncbar { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; justify-content: space-between; }
+.syncbtns { display: flex; flex-wrap: wrap; gap: .5rem; }
 .table-wrap { overflow-x: auto; }
 .tbl { width: 100%; border-collapse: collapse; font-size: .82rem; }
 .tbl th, .tbl td { padding: .45rem .6rem; border-bottom: 1px solid rgba(255,255,255,.06); color: var(--bq-text); text-align: right; white-space: nowrap; }
@@ -166,4 +222,13 @@ onMounted(() => {
 .score { font-weight: 700; }
 .link { border: 0; background: transparent; color: var(--bq-accent); cursor: pointer; display: inline-flex; }
 .tip { margin: .7rem 0 0; font-size: .74rem; color: var(--bq-muted); }
+
+@media (max-width: 640px) {
+  .page { padding: 5rem 0.7rem 2.5rem; }
+  .fld { flex: 1 1 100%; }
+  .fld input { width: 100%; }
+  .controls .btn, .syncbtns .btn { flex: 1 1 100%; justify-content: center; }
+  .tbl { font-size: .74rem; }
+  .tbl th, .tbl td { padding: .35rem .4rem; }
+}
 </style>

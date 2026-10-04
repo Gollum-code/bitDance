@@ -106,6 +106,12 @@ const router = createRouter({
       component: () => import('../views/RealtimeView.vue'),
       meta: { title: '实时行情' },
     },
+    {
+      path: '/analytics/portfolio',
+      name: 'portfolio',
+      component: () => import('../views/PortfolioView.vue'),
+      meta: { title: '组合回测' },
+    },
   ],
   scrollBehavior(to, _from, saved) {
     if (saved) return saved

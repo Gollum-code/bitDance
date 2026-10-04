@@ -90,6 +90,64 @@ export async function uploadCsvToVnpy(
   return r.json()
 }
 
+export interface SyncBatchResult {
+  ts_code: string
+  name?: string
+  ok: boolean
+  imported_count?: number
+  vt_symbol?: string
+  error?: string
+}
+
+export interface SyncBatchPayload {
+  success: boolean
+  total: number
+  ok_count: number
+  results: SyncBatchResult[]
+  message: string
+}
+
+export async function syncBatchToVnpy(
+  items: { ts_code: string; name?: string }[],
+  start_date = '20240101',
+): Promise<SyncBatchPayload> {
+  const r = await fetch('/api/market/sync-batch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items, start_date }),
+  })
+  if (!r.ok) throw new Error(await readError(r))
+  return r.json()
+}
+
+export interface MinuteBar {
+  datetime: string
+  open: number
+  close: number
+  high: number
+  low: number
+  vol: number
+}
+
+export interface MinutePayload {
+  ts_code: string
+  vt_symbol: string
+  bars: MinuteBar[]
+  count?: number
+  message?: string
+}
+
+export async function getMarketMinute(
+  ts_code: string,
+  period = 'm5',
+  count = 320,
+): Promise<MinutePayload> {
+  const params = new URLSearchParams({ ts_code, period, count: String(count) })
+  const r = await fetch(`/api/market/minute?${params.toString()}`)
+  if (!r.ok) throw new Error(await readError(r))
+  return r.json()
+}
+
 export function defaultChartEndDate(): string {
   return new Date().toISOString().slice(0, 10)
 }

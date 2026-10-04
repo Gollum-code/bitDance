@@ -226,4 +226,14 @@ onMounted(async () => {
 .tbl th, .tbl td { padding: .45rem .6rem; border-bottom: 1px solid rgba(255,255,255,.06); color: var(--bq-text); text-align: right; white-space: nowrap; }
 .tbl th.left, .tbl td.left { text-align: left; color: var(--bq-muted); }
 .fails { margin: .6rem 0 0; padding-left: 1.1rem; font-size: .76rem; color: var(--bq-muted); }
+
+@media (max-width: 640px) {
+  .page { padding: 5rem 0.7rem 2.5rem; }
+  .fld { flex: 1 1 100%; }
+  .fld input { width: 100%; }
+  .controls .btn { flex: 1 1 100%; justify-content: center; }
+  .chart-wrap { height: 300px; }
+  .tbl { font-size: .74rem; }
+  .tbl th, .tbl td { padding: .35rem .4rem; }
+}
 </style>

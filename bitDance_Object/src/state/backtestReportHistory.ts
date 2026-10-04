@@ -3,6 +3,8 @@ export interface BacktestReportHistoryEntry {
   createdAt: number
   body: string
   preview: string
+  stats?: Record<string, number | string | null>
+  params?: Record<string, unknown>
 }
 
 const MAX_ITEMS = 80
@@ -37,7 +39,11 @@ export function listBacktestReports(userId: number | string): BacktestReportHist
   return readRaw(userId).sort((a, b) => b.createdAt - a.createdAt)
 }
 
-export function appendBacktestReport(userId: number | string, body: string): BacktestReportHistoryEntry {
+export function appendBacktestReport(
+  userId: number | string,
+  body: string,
+  meta?: { stats?: Record<string, number | string | null>; params?: Record<string, unknown> },
+): BacktestReportHistoryEntry {
   const trimmed = body.trim()
   const preview =
     trimmed.length > 200 ? `${trimmed.slice(0, 200)}…` : trimmed || '（空报告）'
@@ -46,6 +52,8 @@ export function appendBacktestReport(userId: number | string, body: string): Bac
     createdAt: Date.now(),
     body: trimmed,
     preview,
+    stats: meta?.stats,
+    params: meta?.params,
   }
   const next = [entry, ...readRaw(userId)].slice(0, MAX_ITEMS)
   writeRaw(userId, next)
