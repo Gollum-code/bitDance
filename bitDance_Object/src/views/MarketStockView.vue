@@ -3,12 +3,13 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
-import { Database, LineChart } from 'lucide-vue-next'
+import { Database, LineChart, Upload } from 'lucide-vue-next'
 import {
   defaultChartEndDate,
   defaultChartStartDate,
   getMarketDaily,
   syncMarketToVnpy,
+  uploadCsvToVnpy,
   type DailyPayload,
 } from '../services/market'
 
@@ -20,6 +21,8 @@ const start = ref(defaultChartStartDate(2))
 const end = ref(defaultChartEndDate())
 const loading = ref(false)
 const syncing = ref(false)
+const uploading = ref(false)
+const uploadInput = ref<HTMLInputElement | null>(null)
 const errorMessage = ref('')
 const infoMessage = ref('')
 const payload = ref<DailyPayload | null>(null)
@@ -157,6 +160,34 @@ async function handleSync() {
   }
 }
 
+function openUploadDialog() {
+  uploadInput.value?.click()
+}
+
+async function onCsvSelected(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  if (!file.name.toLowerCase().endsWith('.csv')) {
+    errorMessage.value = '仅支持 .csv 格式的日线数据文件'
+    input.value = ''
+    return
+  }
+  uploading.value = true
+  errorMessage.value = ''
+  infoMessage.value = ''
+  try {
+    const res = await uploadCsvToVnpy(file)
+    infoMessage.value = res.message ?? `已导入 ${res.imported_count ?? 0} 条日线`
+    if (tsCode.value) await loadDaily()
+  } catch (err) {
+    errorMessage.value = err instanceof Error ? err.message : '上传失败'
+  } finally {
+    uploading.value = false
+    input.value = ''
+  }
+}
+
 function goBacktest() {
   const vs = vtSymbol.value
   if (!vs) {
@@ -229,12 +260,25 @@ watch([start, end], () => {
           <Database class="ic" />
           {{ syncing ? '同步中…' : '同步日线到本地库' }}
         </button>
+        <button type="button" class="btn secondary" :disabled="uploading" @click="openUploadDialog">
+          <Upload class="ic" />
+          {{ uploading ? '导入中…' : '导入 CSV 日线' }}
+        </button>
+        <input
+          ref="uploadInput"
+          type="file"
+          accept=".csv,text/csv"
+          class="hidden-file"
+          @change="onCsvSelected"
+        />
         <button type="button" class="btn primary" @click="goBacktest">
           <LineChart class="ic" />
           去回测（我的策略）
         </button>
       </div>
-      <p class="tip">请先「同步」再回测，否则本地库可能没有该标的日线数据。</p>
+      <p class="tip">
+        请先「同步」再回测，否则本地库可能没有该标的日线数据；也可导入本地 CSV 日线文件（ts_code,trade_date,open,high,low,close,vol,amount）。
+      </p>
 
       <div class="chart-wrap">
         <v-chart class="chart" :option="chartOption" autoresize />
@@ -339,6 +383,10 @@ h1 {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
+  align-items: center;
+}
+.hidden-file {
+  display: none;
 }
 .btn {
   display: inline-flex;

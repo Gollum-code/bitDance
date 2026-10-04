@@ -76,6 +76,12 @@ const router = createRouter({
       component: () => import('../views/CommunityPostView.vue'),
       meta: { title: '帖子' },
     },
+    {
+      path: '/docs',
+      name: 'docs',
+      component: () => import('../views/DocsView.vue'),
+      meta: { title: '文档中心' },
+    },
   ],
   scrollBehavior(to, _from, saved) {
     if (saved) return saved

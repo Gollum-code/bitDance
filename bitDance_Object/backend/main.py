@@ -21,7 +21,8 @@ from pydantic import BaseModel, EmailStr, Field
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "app.db"
+# 支持测试隔离：BITDANCE_DB_PATH 覆盖数据库文件
+DB_PATH = Path(os.environ.get("BITDANCE_DB_PATH", "")) if os.environ.get("BITDANCE_DB_PATH") else DATA_DIR / "app.db"
 
 JWT_SECRET = os.getenv("BITDANCE_JWT_SECRET", "dev-secret-change-me")
 JWT_ALG = "HS256"

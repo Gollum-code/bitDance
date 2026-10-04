@@ -77,6 +77,19 @@ export async function syncMarketToVnpy(
   return r.json()
 }
 
+export async function uploadCsvToVnpy(
+  file: File,
+): Promise<{ status?: string; imported_count?: number; message?: string }> {
+  const form = new FormData()
+  form.append('file', file)
+  const r = await fetch('/api/tusharestaticsupload/upload/csv', {
+    method: 'POST',
+    body: form,
+  })
+  if (!r.ok) throw new Error(await readError(r))
+  return r.json()
+}
+
 export function defaultChartEndDate(): string {
   return new Date().toISOString().slice(0, 10)
 }

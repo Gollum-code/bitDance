@@ -21,6 +21,7 @@ const nav = [
   { label: '市场看板', to: '/dashboard' },
   { label: '行情', to: '/market' },
   { label: '我的策略', to: '/strategies' },
+  { label: '文档中心', to: '/docs' },
   { label: '会员中心', to: '/member' },
   { label: '社区', to: '/community' },
 ] as const
@@ -281,8 +282,8 @@ watch(menuOpen, (open) => {
   flex: 1;
   flex-wrap: wrap;
   justify-content: center;
-  gap: 0.35rem 1.5rem;
-  margin: 0 1rem;
+  gap: 0.35rem 1.05rem;
+  margin: 0 0.75rem;
 }
 
 @media (min-width: 1024px) {
@@ -292,11 +293,11 @@ watch(menuOpen, (open) => {
 }
 
 .nav-link {
-  font-size: 0.85rem;
+  font-size: 0.8125rem;
   font-weight: 500;
   color: rgba(231, 229, 228, 0.72);
   text-decoration: none;
-  padding: 0.38rem 0.35rem;
+  padding: 0.38rem 0.25rem;
   transform-origin: center center;
   transition:
     color 0.35s ease,
