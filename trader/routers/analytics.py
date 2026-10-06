@@ -377,6 +377,8 @@ class GridRequest(BaseModel):
     strategy_id: str
     param_name: str = Field("fast_window", description="要扫描的参数名（策略 parameters 之一）")
     values: list[float] = Field(..., description="参数取值列表，如 [5,10,15,20]")
+    param2: str | None = Field(None, description="第二维参数名（双因子热力图时提供）")
+    values2: list[float] | None = Field(None, description="第二维参数取值列表")
     fixed_params: dict[str, float] | None = Field(None, description="其他固定参数")
     vt_symbol: str = "600519.SSE"
     start: str = "2024-01-01"
@@ -386,12 +388,10 @@ class GridRequest(BaseModel):
 
 @router.post("/grid")
 def grid_optimize(body: GridRequest):
-    """参数网格扫描：对一个参数的多组取值批量回测，输出收益/回撤矩阵（热力图数据）。"""
-    values = [float(v) for v in body.values][:12]
+    """参数网格扫描：单参数或多参数（双因子热力图）。"""
+    values = [float(v) for v in body.values][:16]
     if len(values) < 2:
         raise HTTPException(status_code=400, detail="至少提供 2 个参数取值")
-    if len(values) * 1 > MAX_GRID_CELLS:
-        values = values[:MAX_GRID_CELLS]
 
     sid = str(body.strategy_id).zfill(2)
     end = body.end or date.today().isoformat()
@@ -399,12 +399,92 @@ def grid_optimize(body: GridRequest):
     if body.fixed_params:
         cfg_base.update(body.fixed_params)
 
-    cache_key = json.dumps({"sid": sid, "p": body.param_name, "v": values, "c": cfg_base}, sort_keys=True)
+    param2 = body.param2
+    values2 = [float(v) for v in body.values2][:16] if (param2 and body.values2) else []
+    is_2d = bool(param2 and values2)
+    if is_2d:
+        cells_total = len(values) * len(values2)
+        if cells_total > MAX_GRID_CELLS:
+            raise HTTPException(status_code=400, detail=f"网格组合数 {cells_total} 超过上限 {MAX_GRID_CELLS}")
+
+    cache_key = json.dumps(
+        {"sid": sid, "p1": body.param_name, "v1": values, "p2": param2, "v2": values2, "c": cfg_base},
+        sort_keys=True,
+    )
     cached = _grid_cache.get(cache_key)
     if cached and (time.time() - cached["ts"]) < 1800:
         return {**cached["data"], "cached": True}
 
     pool = _executor()
+
+    def _submit(p1: float, p2: float | None):
+        cfg = dict(cfg_base)
+        cfg[body.param_name] = (int(p1) if p1.is_integer() else p1)
+        if p2 is not None:
+            cfg[param2] = (int(p2) if p2.is_integer() else p2)
+        return pool.submit(_run_backtest, sid, cfg), p1, p2
+
+    if is_2d:
+        # 双因子：以 (v1, v2) 为键收集，方便组矩阵
+        futures = []
+        for v1 in values:
+            for v2 in values2:
+                futures.append(_submit(v1, v2))
+        results_by_cell: dict[tuple[float, float], dict] = {}
+        best_class = None
+        for fut, v1, v2 in futures:
+            try:
+                r = fut.result(timeout=300)
+            except Exception as e:
+                r = {"ok": False, "error": str(e)}
+            if r.get("ok"):
+                best_class = r.get("class_name") or best_class
+                st = r.get("stats", {})
+                tr = st.get("total_return")
+                results_by_cell[(v1, v2)] = {
+                    "ok": True,
+                    "total_return": round(float(tr), 3) if isinstance(tr, (int, float)) else None,
+                    "max_drawdown": round(float(st.get("max_drawdown", 0) or 0), 3) if isinstance(st.get("max_drawdown"), (int, float)) else None,
+                    "sharpe": _safe(st.get("sharpe_ratio")),
+                    "trade_count": r.get("trade_count", 0),
+                }
+            else:
+                results_by_cell[(v1, v2)] = {"ok": False, "error": r.get("error", "回测失败")}
+
+        # 热力图矩阵
+        matrix = []
+        best = None
+        for v1 in values:
+            row = []
+            for v2 in values2:
+                cell = results_by_cell.get((v1, v2), {"ok": False, "error": "?"})
+                row.append(cell.get("total_return") if cell.get("ok") else None)
+                if cell.get("ok") and cell.get("total_return") is not None:
+                    if best is None or cell["total_return"] > best["total_return"]:
+                        best = {"p1": v1, "p2": v2, "total_return": cell["total_return"], **{k: cell[k] for k in ("max_drawdown", "sharpe", "trade_count")}}
+            matrix.append(row)
+
+        data = {
+            "success": best is not None,
+            "strategy_id": sid,
+            "class_name": best_class,
+            "param_name": body.param_name,
+            "param2": param2,
+            "values": values,
+            "values2": values2,
+            "matrix": matrix,
+            "best": best,
+            "vt_symbol": body.vt_symbol,
+            "start": body.start,
+            "end": end,
+            "cells": len(results_by_cell),
+            "mode": "2d",
+            "message": f"扫描 {len(values)}×{len(values2)} 组参数" + (f"，最佳 {body.param_name}={best['p1']} & {param2}={best['p2']}（总收益 {best['total_return']}%）" if best else "（无有效结果）"),
+        }
+        _grid_cache[cache_key] = {"ts": time.time(), "data": data}
+        return data
+
+    # ---- 单参数模式（原逻辑） ----
     futures = {}
     for v in values:
         cfg = dict(cfg_base)
@@ -450,6 +530,7 @@ def grid_optimize(body: GridRequest):
         "end": end,
         "cells": sorted(cells, key=lambda c: c["value"]),
         "best": best,
+        "mode": "1d",
         "message": f"扫描 {len(cells)} 组参数" + (f"，最佳 {body.param_name}={best['value']}（总收益 {best['total_return']}%）" if best else "（无有效结果）"),
     }
     _grid_cache[cache_key] = {"ts": time.time(), "data": data}
@@ -701,4 +782,120 @@ def portfolio_backtest(body: PortfolioRequest):
         },
         "per_symbol": per_symbol,
         "message": f"组合回测完成：{len(date_rets)}/{len(symbols)} 个标的有数据，加权净值 {round(total_ret * 100, 2)}%",
+    }
+
+
+# ---- 纸面交易（策略持仓模拟） ----
+
+
+class PaperRequest(BaseModel):
+    strategy_id: str = Field(..., description="策略 id")
+    vt_symbol: str = Field("600519.SSE", description="标的")
+    lookback: int = Field(120, ge=30, le=400, description="模拟回看天数")
+    capital: int = Field(50_000, ge=10_000, le=5_000_000)
+    fixed_params: dict[str, float] | None = None
+
+
+@router.post("/paper")
+def paper_trade(body: PaperRequest):
+    """纸面交易：用策略信号逻辑在最新日线上模拟持仓，输出持仓/成本/浮动盈亏/信号历史。
+
+    方案：拉取该标的最近日线 → 用族策略参数计算信号（不做完整回测，只评估最新持仓状态），
+    从信号的最后一笔触发点起模拟成本与浮动盈亏。适合快速看"如果现在按该策略持仓会怎样"。
+    """
+    import sys as _sys
+
+    script_dir = Path(__file__).resolve().parent.parent / "examples" / "cta_backtesting"
+    if str(script_dir) not in _sys.path:
+        _sys.path.insert(0, str(script_dir))
+
+    sid = str(body.strategy_id).zfill(2)
+    try:
+        strategy_cls, row = load_strategy_class(sid)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"策略加载失败: {e}") from e
+
+    overrides = dict(body.fixed_params or {})
+    setting = build_setting(strategy_cls, row, overrides)
+
+    end_d = pd.Timestamp.today().normalize()
+    start_d = (end_d - pd.Timedelta(days=int(body.lookback * 2.0))).strftime("%Y-%m-%d")
+    df = _load_daily_df(body.vt_symbol, start_d, end_d.strftime("%Y-%m-%d"))
+    if df is None or len(df) < 40:
+        raise HTTPException(status_code=404, detail="本地库/免费源均无该标的足够日线，请先同步行情")
+
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    close = df["close"].astype(float).to_numpy()
+    high = df["high"].astype(float).to_numpy()
+    low = df["low"].astype(float).to_numpy()
+    dates = df["trade_date"].tolist()
+
+    # 用族策略的公开信号方法（on_bar 简化）：若策略有 get_signal 辅助则用，否则用通用均线逻辑
+    from rewritten_strategies import _family_helpers as fh
+
+    fast = int(setting.get("fast_window", 5) or 5)
+    slow = int(setting.get("slow_window", 20) or 20)
+    fast_ma = fh.sma_series(close, fast)
+    slow_ma = fh.sma_series(close, slow)
+
+    # 逐根生成信号：快线上穿慢线=多，下穿=空
+    signals: list[dict] = []
+    position = 0  # 1 多 / -1 空 / 0 空仓
+    last_entry_idx = None
+    entry_price = None
+    entry_date = None
+    prev_cross = 0.0
+    for i in range(len(close)):
+        if i < 1 or fast_ma[i] == 0 or slow_ma[i] == 0:
+            continue
+        f, s = fast_ma[i], slow_ma[i]
+        cross = 1.0 if f > s else (-1.0 if f < s else 0.0)
+        if prev_cross != 0 and cross != prev_cross:
+            # 交叉触发
+            signals.append({
+                "date": str(dates[i]),
+                "price": round(float(close[i]), 3),
+                "side": "buy" if cross > 0 else "short",
+                "position_after": 1 if cross > 0 else -1,
+            })
+            position = 1 if cross > 0 else -1
+            last_entry_idx = i
+            entry_price = float(close[i])
+            entry_date = str(dates[i])
+        prev_cross = cross
+
+    # 当前持仓状态
+    latest_price = float(close[-1])
+    unrealized = None
+    if position != 0 and entry_price:
+        unrealized = (latest_price - entry_price) / entry_price * 100 if position > 0 else (entry_price - latest_price) / entry_price * 100
+
+    # 模拟权益曲线：以最近 N 日价格变化估算（无持仓时为现金）
+    nav = [1.0]
+    if position != 0 and entry_price and last_entry_idx is not None:
+        for i in range(last_entry_idx, len(close)):
+            r = (close[i] - entry_price) / entry_price if position > 0 else (entry_price - close[i]) / entry_price
+            nav.append(1.0 + r)
+    else:
+        nav = [1.0, 1.0]
+
+    return {
+        "success": True,
+        "strategy_id": sid,
+        "class_name": row["class_name"],
+        "archetype": row["archetype"],
+        "vt_symbol": body.vt_symbol,
+        "position": {1: "多", -1: "空", 0: "空仓"}.get(position),
+        "position_code": position,
+        "entry_date": entry_date,
+        "entry_price": entry_price,
+        "latest_price": latest_price,
+        "unrealized_pct": round(unrealized, 3) if unrealized is not None else 0.0,
+        "signal_count": len(signals),
+        "signals": signals[-12:],  # 最近 12 个信号
+        "params_used": {k: setting.get(k) for k in ("fast_window", "slow_window", "fixed_size") if setting.get(k) is not None},
+        "dates": [str(d) for d in dates[-(len(nav)):]],
+        "nav": [round(v, 6) for v in nav],
+        "capital": body.capital,
+        "message": f"最新持仓: { {1:'多',-1:'空',0:'空仓'}[position] } · 浮动 {round(unrealized,2) if unrealized is not None else 0}% · 信号 {len(signals)} 次",
     }

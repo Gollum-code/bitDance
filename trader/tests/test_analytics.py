@@ -90,6 +90,7 @@ def test_vt_tx_code_conversion_in_factor(monkeypatch):
         ("/analytics/grid", {"POST"}),
         ("/analytics/realtime", {"GET"}),
         ("/analytics/portfolio", {"POST"}),
+        ("/analytics/paper", {"POST"}),
         ("/api/market/minute", {"GET"}),
         ("/api/market/sync-batch", {"POST"}),
     ],

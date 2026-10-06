@@ -128,6 +128,12 @@ function guarded(to: string) {
           <p>单个策略在多个标的上等权/加权组合回测，输出组合净值、回撤与夏普。</p>
           <span class="card-meta">进入 →</span>
         </RouterLink>
+
+        <RouterLink to="/analytics/paper" class="card">
+          <h2>纸面交易</h2>
+          <p>用策略信号在最新日线上模拟持仓，看当前多空状态、浮动盈亏与信号历史。</p>
+          <span class="card-meta">进入 →</span>
+        </RouterLink>
       </section>
 
       <StrategyWorkshop />

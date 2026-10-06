@@ -63,6 +63,7 @@ export interface GridPayload {
   strategy_id: string
   class_name?: string | null
   param_name: string
+  param2?: string | null
   vt_symbol: string
   start: string
   end: string
@@ -70,6 +71,19 @@ export interface GridPayload {
   best?: GridCell | null
   message: string
   cached?: boolean
+  mode?: '1d' | '2d'
+  values?: number[]
+  values2?: number[]
+  matrix?: (number | null)[][]
+}
+
+export interface Grid2DBest {
+  p1: number
+  p2: number
+  total_return?: number
+  max_drawdown?: number
+  sharpe?: number
+  trade_count?: number
 }
 
 export interface RealtimeQuote {
@@ -83,9 +97,7 @@ export interface PortfolioSymbolResult {
   class_name?: string
   total_return?: number
   trade_count?: number
-}
-
-export interface PortfolioPayload {
+}export interface PortfolioPayload {
   success: boolean
   strategy_id: string
   class_name?: string | null
@@ -103,6 +115,34 @@ export interface PortfolioPayload {
     total_trade_count?: number
   }
   per_symbol: PortfolioSymbolResult[]
+  message: string
+}
+
+export interface PaperSignal {
+  date: string
+  price: number
+  side: 'buy' | 'short'
+  position_after: number
+}
+
+export interface PaperPayload {
+  success: boolean
+  strategy_id: string
+  class_name?: string
+  archetype?: string
+  vt_symbol: string
+  position: '多' | '空' | '空仓'
+  position_code: number
+  entry_date?: string | null
+  entry_price?: number | null
+  latest_price: number
+  unrealized_pct: number
+  signal_count: number
+  signals: PaperSignal[]
+  params_used?: Record<string, unknown>
+  dates: string[]
+  nav: number[]
+  capital: number
   message: string
 }
 
@@ -151,6 +191,8 @@ export function runGrid(body: {
   strategy_id: string
   param_name: string
   values: number[]
+  param2?: string
+  values2?: number[]
   fixed_params?: Record<string, number>
   vt_symbol?: string
   start?: string
@@ -170,6 +212,16 @@ export function runPortfolio(body: {
   fixed_params?: Record<string, number>
 }): Promise<PortfolioPayload> {
   return post('/analytics/portfolio', body)
+}
+
+export function runPaper(body: {
+  strategy_id: string
+  vt_symbol: string
+  lookback?: number
+  capital?: number
+  fixed_params?: Record<string, number>
+}): Promise<PaperPayload> {
+  return post('/analytics/paper', body)
 }
 
 export async function getRealtime(symbols: string[]): Promise<{ items: RealtimeQuote[]; count: number }> {

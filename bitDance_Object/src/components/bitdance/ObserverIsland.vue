@@ -31,6 +31,7 @@ const toolNav = [
   { label: '因子选股', to: '/analytics/screen' },
   { label: '参数优化', to: '/analytics/grid' },
   { label: '组合回测', to: '/analytics/portfolio' },
+  { label: '纸面交易', to: '/analytics/paper' },
   { label: '实时行情', to: '/analytics/realtime' },
 ] as const
 
@@ -42,6 +43,7 @@ function isActive(path: string) {
   if (path === '/analytics/grid') return route.path.startsWith('/analytics/grid')
   if (path === '/analytics/realtime') return route.path.startsWith('/analytics/realtime')
   if (path === '/analytics/portfolio') return route.path.startsWith('/analytics/portfolio')
+if (path === '/analytics/paper') return route.path.startsWith('/analytics/paper')
   return route.path === path
 }
 function closeMenu() {

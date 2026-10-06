@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { Radio, RefreshCw, Wifi, WifiOff } from 'lucide-vue-next'
+import { Radio, RefreshCw, Wifi, WifiOff, Bell } from 'lucide-vue-next'
 import { getRealtime, openRealtimeWs, type RealtimeQuote } from '../services/analytics'
 
 const DEFAULT_WATCH = ['sh600519', 'sh601318', 'sz000858', 'sh600036', 'sz000001', 'sh601166']
@@ -13,6 +13,19 @@ const err = ref('')
 const lastUpdate = ref('')
 let closeFn: (() => void) | null = null
 
+interface AlertRule {
+  code: string
+  kind: 'below' | 'above'
+  value: number
+  fired: boolean
+}
+const alertRules = ref<AlertRule[]>([])
+const alertCode = ref('sh600519')
+const alertKind = ref<'below' | 'above'>('below')
+const alertValue = ref(1000)
+const alertMessage = ref('')
+const alertCount = ref(0)
+
 function parseCodes() {
   return codes.value
     .split(/[,，\s]+/)
@@ -21,11 +34,58 @@ function parseCodes() {
     .slice(0, 60)
 }
 
+function num(q: RealtimeQuote, ...keys: string[]): number | null {
+  for (const k of keys) {
+    const v = Number(q[k])
+    if (!Number.isNaN(v)) return v
+  }
+  return null
+}
+
+function nameOf(code: string): string {
+  return String(rows.value[code]?.name ?? code)
+}
+
+function checkAlerts(items: RealtimeQuote[]) {
+  for (const q of items) {
+    const code = String(q.code ?? q.symbol ?? '')
+    if (!code) continue
+    const price = num(q, 'now', '最新价', 'price', 'close')
+    if (price === null) continue
+    for (const rule of alertRules.value) {
+      if (rule.code !== code || rule.fired) continue
+      const hit = rule.kind === 'below' ? price <= rule.value : price >= rule.value
+      if (!hit) continue
+      rule.fired = true
+      alertCount.value += 1
+      alertMessage.value = `${nameOf(code)} ${rule.kind === 'below' ? '跌破' : '涨超'} ${rule.value}（现价 ${price.toFixed(2)}）`
+    }
+  }
+}
+
+function addAlert() {
+  const code = alertCode.value.trim().toLowerCase()
+  if (!code || !alertRules.value.some((r) => r.code === code && r.kind === alertKind.value && r.value === alertValue.value)) {
+    alertRules.value.push({ code, kind: alertKind.value, value: alertValue.value, fired: false })
+  }
+}
+
+function removeAlert(i: number) {
+  alertRules.value.splice(i, 1)
+}
+
+function resetAlerts() {
+  alertRules.value.forEach((r) => (r.fired = false))
+  alertCount.value = 0
+  alertMessage.value = ''
+}
+
 function absorb(items: RealtimeQuote[]) {
   for (const q of items) {
     const code = String(q.code ?? q.symbol ?? '')
     if (code) rows.value[code] = q
   }
+  checkAlerts(items)
   updating.value = true
   setTimeout(() => (updating.value = false), 200)
   lastUpdate.value = new Date().toLocaleTimeString()
@@ -69,14 +129,6 @@ function field(q: RealtimeQuote, ...keys: string[]): string {
     if (v !== undefined && v !== null && v !== '') return String(v)
   }
   return '—'
-}
-
-function num(q: RealtimeQuote, ...keys: string[]): number | null {
-  for (const k of keys) {
-    const v = Number(q[k])
-    if (!Number.isNaN(v)) return v
-  }
-  return null
 }
 
 function changeClass(q: RealtimeQuote) {
@@ -127,6 +179,33 @@ onUnmounted(disconnect)
       <p class="hint">支持 sh / sz / bj 前缀，最多 60 只。腾讯接口为延迟行情，仅供研究演示。</p>
       <p v-if="err" class="err">{{ err }}</p>
       <p v-if="lastUpdate" class="ok">最近更新：{{ lastUpdate }}</p>
+    </section>
+
+    <section class="panel">
+      <h2 class="h2">
+        <Bell class="ic" /> 价格预警
+        <span v-if="alertCount" class="alert-badge">{{ alertCount }}</span>
+      </h2>
+      <div class="alert-form">
+        <input v-model="alertCode" class="mono" placeholder="sh600519" />
+        <select v-model="alertKind">
+          <option value="below">跌破</option>
+          <option value="above">涨超</option>
+        </select>
+        <input v-model.number="alertValue" type="number" placeholder="阈值" />
+        <button class="btn" @click="addAlert">添加规则</button>
+        <button class="btn" @click="resetAlerts">重置触发</button>
+      </div>
+      <p v-if="alertMessage" class="alert-hit">{{ alertMessage }}</p>
+      <ul v-if="alertRules.length" class="alert-list">
+        <li v-for="(rule, i) in alertRules" :key="i">
+          <span class="mono">{{ rule.code }}</span>
+          <span>{{ rule.kind === 'below' ? '跌破' : '涨超' }} {{ rule.value }}</span>
+          <span :class="rule.fired ? 'hit' : 'idle'">{{ rule.fired ? '已触发' : '监控中' }}</span>
+          <button class="rm" @click="removeAlert(i)">×</button>
+        </li>
+      </ul>
+      <p class="hint">规则在每次行情推送时自动检测，命中即标记（WS 连接期间有效）。</p>
     </section>
 
     <section class="panel">
@@ -187,6 +266,21 @@ onUnmounted(disconnect)
 .up { color: #ef4444; }
 .down { color: #22c55e; }
 .muted-cell { padding: 1rem 0; text-align: center; color: var(--bq-muted); font-size: .82rem; }
+
+.h2 { display: flex; align-items: center; gap: .35rem; margin: 0 0 .7rem; font-size: .95rem; color: var(--bq-text); }
+.alert-badge { background: #ef4444; color: #fff; border-radius: 999px; font-size: .68rem; padding: .05rem .4rem; }
+.alert-form { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+.alert-form input[type="text"], .alert-form input.mono { border: 1px solid rgba(255,255,255,.14); border-radius: .5rem; padding: .45rem .5rem; background: rgba(8,12,21,.7); color: var(--bq-text); width: 130px; }
+.alert-form input[type="number"] { border: 1px solid rgba(255,255,255,.14); border-radius: .5rem; padding: .45rem .5rem; background: rgba(8,12,21,.7); color: var(--bq-text); width: 100px; }
+.alert-form select { border: 1px solid rgba(255,255,255,.14); border-radius: .5rem; padding: .45rem .5rem; background: rgba(8,12,21,.7); color: var(--bq-text); }
+.mono { font-family: ui-monospace, monospace; }
+.alert-hit { margin: .6rem 0 0; color: #f0b429; font-size: .84rem; }
+.alert-list { margin: .6rem 0 0; padding: 0; list-style: none; display: grid; gap: .3rem; }
+.alert-list li { display: flex; align-items: center; gap: .5rem; font-size: .8rem; color: var(--bq-text); border: 1px solid rgba(255,255,255,.08); border-radius: .5rem; padding: .35rem .6rem; }
+.alert-list .mono { color: var(--bq-muted); }
+.alert-list .hit { color: #f0b429; margin-left: auto; }
+.alert-list .idle { color: var(--bq-muted); margin-left: auto; }
+.alert-list .rm { border: 0; background: transparent; color: #f87171; cursor: pointer; font-size: 1rem; }
 
 @media (max-width: 640px) {
   .page { padding: 5rem 0.7rem 2.5rem; }

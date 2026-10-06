@@ -112,6 +112,12 @@ const router = createRouter({
       component: () => import('../views/PortfolioView.vue'),
       meta: { title: '组合回测' },
     },
+    {
+      path: '/analytics/paper',
+      name: 'paper-trading',
+      component: () => import('../views/PaperTradingView.vue'),
+      meta: { title: '纸面交易' },
+    },
   ],
   scrollBehavior(to, _from, saved) {
     if (saved) return saved

@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import type { EChartsOption } from 'echarts'
+import VChart from 'vue-echarts'
 import { Grid3x3, Play, Loader2 } from 'lucide-vue-next'
 import { listStrategies, type StrategyListItem } from '../services/backtest'
 import { runGrid, type GridPayload } from '../services/analytics'
@@ -13,23 +15,32 @@ const vtSymbol = ref('600519.SSE')
 const start = ref(defaultChartStartDate(2))
 const end = ref(defaultChartEndDate())
 
+const use2D = ref(false)
+const param2 = ref('slow_window')
+const values2Text = ref('20,30,40,50,60')
+
 const loading = ref(false)
 const err = ref('')
 const data = ref<GridPayload | null>(null)
 
 const paramCandidates = ['fast_window', 'slow_window', 'signal_window', 'atr_window', 'atr_mult', 'fixed_size']
 
-function parseValues(): number[] {
-  return valuesText.value
+function parseValues(text: string): number[] {
+  return text
     .split(/[,，\s]+/)
     .map((s) => Number(s.trim()))
     .filter((n) => !Number.isNaN(n) && n > 0)
 }
 
 async function run() {
-  const values = parseValues()
+  const values = parseValues(valuesText.value)
   if (values.length < 2) {
     err.value = '至少输入 2 个参数取值（逗号分隔）'
+    return
+  }
+  const v2 = parseValues(values2Text.value)
+  if (use2D.value && v2.length < 2) {
+    err.value = '双因子模式第二维至少需要 2 个取值'
     return
   }
   loading.value = true
@@ -39,6 +50,8 @@ async function run() {
       strategy_id: sid.value,
       param_name: paramName.value,
       values,
+      param2: use2D.value ? param2.value : undefined,
+      values2: use2D.value ? v2 : undefined,
       vt_symbol: vtSymbol.value.trim(),
       start: start.value,
       end: end.value,
@@ -50,6 +63,65 @@ async function run() {
     loading.value = false
   }
 }
+
+const heatOption = computed(() => {
+  const values = data.value?.values ?? []
+  const values2 = data.value?.values2 ?? []
+  const matrix = data.value?.matrix ?? []
+  const cellData: [number, number, number][] = []
+  matrix.forEach((row, i) => {
+    row.forEach((v, j) => {
+      if (v !== null && v !== undefined && !Number.isNaN(v)) cellData.push([j, i, v])
+    })
+  })
+  return {
+    backgroundColor: 'transparent',
+    animation: false,
+    tooltip: {
+      formatter: (params: unknown) => {
+        const p = params as { value: [number, number, number] }
+        const [, i, v] = p.value
+        const p1 = values[i]
+        const p2 = values2[Math.floor(p.value[0])]
+        return `${data.value?.param_name}=${p1}<br/>${data.value?.param2}=${p2}<br/>总收益：${v.toFixed(3)}%`
+      },
+    },
+    grid: { left: 72, right: 24, top: 24, bottom: 64 },
+    xAxis: {
+      type: 'category',
+      data: values2,
+      name: data.value?.param2 ?? '参数2',
+      nameTextStyle: { color: '#7f8ea3' },
+      axisLabel: { color: '#7f8ea3', fontSize: 10 },
+      splitArea: { show: true },
+    },
+    yAxis: {
+      type: 'category',
+      data: values,
+      name: data.value?.param_name ?? '参数1',
+      nameTextStyle: { color: '#7f8ea3' },
+      axisLabel: { color: '#7f8ea3', fontSize: 10 },
+      splitArea: { show: true },
+    },
+    visualMap: {
+      min: -10,
+      max: 20,
+      calculable: true,
+      orient: 'horizontal',
+      left: 'center',
+      bottom: 0,
+      inRange: { color: ['#2563eb', '#3b82f6', '#f59e0b', '#ef4444'] },
+    },
+    series: [
+      {
+        type: 'heatmap',
+        data: cellData,
+        label: { show: true, color: '#fff', fontSize: 10, formatter: (p: { value: number[] }) => (p.value[2] ?? 0).toFixed(1) },
+        emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.5)' } },
+      },
+    ],
+  }
+})
 
 const series = computed(() => ({
   values: data.value?.cells.filter((c) => c.ok).map((c) => c.value) ?? [],
@@ -85,7 +157,7 @@ onMounted(async () => {
     <header class="head">
       <div>
         <h1 class="title"><Grid3x3 class="ic" /> 参数网格优化</h1>
-        <p class="lead">单参数网格扫描，观察总收益 / 最大回撤随参数取值的变化</p>
+        <p class="lead">单参数扫描或双参数热力图，观察总收益 / 回撤随参数取值的变化</p>
       </div>
     </header>
 
@@ -119,6 +191,26 @@ onMounted(async () => {
           {{ loading ? '扫描中…' : '开始扫描' }}
         </button>
       </div>
+      <div class="controls">
+        <label class="fld">
+          <span>双因子热力图</span>
+          <span class="switch-row">
+            <input id="use2d" v-model="use2D" type="checkbox" />
+            <label for="use2d">启用第二维参数</label>
+          </span>
+        </label>
+        <label v-if="use2D" class="fld">
+          <span>第二维参数</span>
+          <select v-model="param2">
+            <option v-for="p in paramCandidates.filter((x) => x !== paramName)" :key="p" :value="p">{{ p }}</option>
+          </select>
+        </label>
+        <label v-if="use2D" class="fld">
+          <span>第二维取值（逗号分隔）</span>
+          <input v-model="values2Text" placeholder="20,30,40,50,60" />
+        </label>
+        <p class="hint">双因子模式会扫描两参数的全部组合（最多 60 格），用热力图展示总收益分布。</p>
+      </div>
       <p v-if="err" class="err">{{ err }}</p>
       <p v-else-if="data" class="ok">
         {{ data.message }}<span v-if="data.cached">（缓存）</span>
@@ -126,7 +218,19 @@ onMounted(async () => {
     </section>
 
     <template v-if="data?.success">
-      <section class="panel">
+      <section v-if="data.mode === '2d'" class="panel">
+        <h2 class="h2">
+          双参数热力图：总收益分布（{{ data.vt_symbol }} {{ data.start }} → {{ data.end }}）
+        </h2>
+        <div class="chart-wrap">
+          <v-chart class="chart" :option="heatOption" autoresize />
+        </div>
+        <p class="hint" v-if="data.best && (data.best as { p1?: number }).p1 != null">
+          最佳组合：{{ data.param_name }}={{ (data.best as { p1?: number }).p1 }} · {{ data.param2 }}={{ (data.best as { p2?: number }).p2 }}（总收益 {{ (data.best as { total_return?: number }).total_return }}%）
+        </p>
+      </section>
+
+      <section v-if="data.mode !== '2d'" class="panel">
         <h2 class="h2">总收益 / 回撤 扫描（{{ data.vt_symbol }} {{ data.start }} → {{ data.end }}）</h2>
         <div class="bar-list">
           <div v-for="c in data.cells.filter((x) => x.ok)" :key="c.value" class="bar-row">
@@ -148,7 +252,7 @@ onMounted(async () => {
         </div>
       </section>
 
-      <section class="panel">
+      <section v-if="data.mode !== '2d'" class="panel">
         <h2 class="h2">明细</h2>
         <div class="table-wrap">
           <table class="tbl">
@@ -215,6 +319,11 @@ onMounted(async () => {
 .tbl { width: 100%; border-collapse: collapse; font-size: .82rem; }
 .tbl th, .tbl td { padding: .45rem .6rem; border-bottom: 1px solid rgba(255,255,255,.06); color: var(--bq-text); text-align: right; white-space: nowrap; }
 .bestrow { background: rgba(34,197,94,.08); }
+.chart-wrap { height: 420px; }
+.chart { width: 100%; height: 100%; }
+.switch-row { display: flex; align-items: center; gap: .35rem; padding-top: .3rem; }
+.switch-row label { color: var(--bq-muted); font-size: .78rem; }
+.hint { margin: .5rem 0 0; font-size: .76rem; color: var(--bq-muted); }
 
 @media (max-width: 640px) {
   .page { padding: 5rem 0.7rem 2.5rem; }
