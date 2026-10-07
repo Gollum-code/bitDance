@@ -12,8 +12,8 @@ const loading = ref(true)
 const errorText = ref('')
 const keyword = ref('')
 
-// 股票池：沪深 300 蓝筹 + 热门成长
-const watchlist = [
+// 自选股：默认沪深 300 蓝筹 + 热门成长，可持久化到 localStorage 并自定义增删
+const DEFAULT_WATCHLIST = [
   '600519.SH',
   '601318.SH',
   '600036.SH',
@@ -28,7 +28,52 @@ const watchlist = [
   '601888.SH',
 ]
 
-const stockNames: Record<string, string> = {
+const WATCH_KEY = 'bitdance_watchlist'
+
+function loadWatchlist(): string[] {
+  try {
+    const raw = localStorage.getItem(WATCH_KEY)
+    if (!raw) return [...DEFAULT_WATCHLIST]
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return [...DEFAULT_WATCHLIST]
+    const codes = parsed.filter((x): x is string => typeof x === 'string' && x.includes('.'))
+    return codes.length ? codes.slice(0, 30) : [...DEFAULT_WATCHLIST]
+  } catch {
+    return [...DEFAULT_WATCHLIST]
+  }
+}
+
+const watchlist = ref<string[]>(loadWatchlist())
+
+function saveWatchlist() {
+  localStorage.setItem(WATCH_KEY, JSON.stringify(watchlist.value))
+}
+
+function addToWatchlist(code: string) {
+  const c = code.trim().toUpperCase()
+  if (!c || watchlist.value.includes(c)) return
+  watchlist.value.push(c)
+  stockNames.value[c] = stockNames.value[c] ?? guessName(c)
+  saveWatchlist()
+  void loadQuotes()
+}
+
+function removeFromWatchlist(code: string) {
+  watchlist.value = watchlist.value.filter((c) => c !== code)
+  saveWatchlist()
+  if (!watchlist.value.length) watchempty.value = true
+  void loadQuotes()
+}
+
+const watchempty = ref(false)
+
+function guessName(code: string) {
+  // 搜索项命中时用服务端名称，否则回退为代码
+  const hit = searchItems.value.find((it) => it.ts_code === code)
+  return hit?.name ?? code
+}
+
+const stockNames = ref<Record<string, string>>({
   '600519.SH': '贵州茅台',
   '601318.SH': '中国平安',
   '600036.SH': '招商银行',
@@ -41,7 +86,7 @@ const stockNames: Record<string, string> = {
   '000333.SZ': '美的集团',
   '600030.SH': '中信证券',
   '601888.SH': '中国中免',
-}
+})
 
 type WatchQuote = {
   code: string
@@ -61,7 +106,8 @@ const searchErr = ref('')
 
 async function loadQuotes() {
   const rows: WatchQuote[] = []
-  for (const code of watchlist) {
+  const names = stockNames.value
+  for (const code of watchlist.value) {
     try {
       const today = new Date()
       const end = today.toISOString().slice(0, 10)
@@ -75,7 +121,7 @@ async function loadQuotes() {
       const pct = prevClose ? ((last.close - prevClose) / prevClose) * 100 : 0
       rows.push({
         code,
-        name: stockNames[code] ?? code,
+        name: names[code] ?? code,
         vtSymbol: d.vt_symbol ?? '',
         last: last.close,
         pct,
@@ -101,6 +147,12 @@ async function doSearch() {
   try {
     const r = await listMarketStocks(q, 20)
     searchItems.value = r.items ?? []
+    for (const it of searchItems.value) {
+      const code = it.ts_code
+      if (!code) continue
+      stockNames.value[code] = it.name ?? stockNames.value[code] ?? code
+      if (it.name) stockNames.value[code] = it.name
+    }
   } catch (e) {
     searchErr.value = e instanceof Error ? e.message : '搜索失败'
   } finally {
@@ -122,6 +174,7 @@ const marketAvg = computed(() => {
 
 onMounted(async () => {
   loading.value = true
+  watchempty.value = watchlist.value.length === 0
   await loadQuotes()
   loading.value = false
 })
@@ -171,6 +224,7 @@ onMounted(async () => {
               <th>代码</th>
               <th>名称</th>
               <th>vtSymbol</th>
+              <th>操作</th>
               <th></th>
             </tr>
           </thead>
@@ -179,6 +233,17 @@ onMounted(async () => {
               <td class="mono">{{ it.ts_code }}</td>
               <td>{{ it.name }}</td>
               <td class="mono muted">{{ it.vt_symbol }}</td>
+              <td>
+                <button
+                  v-if="!watchlist.includes(it.ts_code)"
+                  type="button"
+                  class="link"
+                  @click="addToWatchlist(it.ts_code)"
+                >
+                  + 加入自选
+                </button>
+                <span v-else class="muted">已自选</span>
+              </td>
               <td>
                 <RouterLink :to="{ path: '/market/stock', query: { ts_code: it.ts_code } }" class="link">
                   日线 →
@@ -226,7 +291,7 @@ onMounted(async () => {
       <p class="sub-title">自选股近 90 日走势（收盘价）</p>
       <table class="table">
         <thead>
-          <tr><th>名称</th><th>现价</th><th>涨跌</th><th>涨跌幅</th></tr>
+          <tr><th>名称</th><th>现价</th><th>涨跌</th><th>涨跌幅</th><th></th></tr>
         </thead>
         <tbody>
           <tr v-for="q in quotes" :key="q.code">
@@ -242,9 +307,17 @@ onMounted(async () => {
             <td class="mono" :class="q.pct >= 0 ? 'up' : 'down'">
               {{ q.pct >= 0 ? '+' : '' }}{{ q.pct.toFixed(2) }}%
             </td>
+            <td>
+              <button type="button" class="link danger" @click="removeFromWatchlist(q.code)">
+                移除
+              </button>
+            </td>
           </tr>
         </tbody>
       </table>
+      <p v-if="watchempty" class="muted-note">
+        自选股已清空。用上方搜索框搜索代码或名称，点击「+ 加入自选」重新添加。
+      </p>
     </section>
   </div>
 </template>
@@ -387,6 +460,14 @@ th {
 }
 .link:hover {
   text-decoration: underline;
+}
+.link.danger {
+  color: #f87171;
+}
+.muted-note {
+  margin: 0.8rem 0 0;
+  color: rgba(168, 184, 207, 0.7);
+  font-size: 0.82rem;
 }
 .search-results {
   margin-bottom: 0.4rem;

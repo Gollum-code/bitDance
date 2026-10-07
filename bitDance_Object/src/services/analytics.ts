@@ -125,6 +125,29 @@ export interface PaperSignal {
   position_after: number
 }
 
+export interface HeatmapBucket {
+  label: string
+  min: number
+  max: number
+  count: number
+}
+
+export interface HeatmapItem {
+  ts_code: string
+  name: string
+  pct: number
+  now: number
+}
+
+export interface HeatmapPayload {
+  success: boolean
+  sample: number
+  items: HeatmapItem[]
+  buckets: HeatmapBucket[]
+  breadth: { up: number; down: number; flat: number }
+  message: string
+}
+
 export interface PaperPayload {
   success: boolean
   strategy_id: string
@@ -222,6 +245,13 @@ export function runPaper(body: {
   fixed_params?: Record<string, number>
 }): Promise<PaperPayload> {
   return post('/analytics/paper', body)
+}
+
+export function runHeatmap(body: {
+  sample?: number
+  end_date?: string
+}): Promise<HeatmapPayload> {
+  return post('/analytics/heatmap', body)
 }
 
 export async function getRealtime(symbols: string[]): Promise<{ items: RealtimeQuote[]; count: number }> {

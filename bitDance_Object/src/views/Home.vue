@@ -134,6 +134,12 @@ function guarded(to: string) {
           <p>用策略信号在最新日线上模拟持仓，看当前多空状态、浮动盈亏与信号历史。</p>
           <span class="card-meta">进入 →</span>
         </RouterLink>
+
+        <RouterLink to="/analytics/heatmap" class="card">
+          <h2>市场热力图</h2>
+          <p>免费实时快照按涨跌幅渲染，直观展示全市场上涨/下跌广度分布。</p>
+          <span class="card-meta">进入 →</span>
+        </RouterLink>
       </section>
 
       <StrategyWorkshop />

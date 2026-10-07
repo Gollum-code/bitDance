@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { BarChart3, Play, Loader2, ExternalLink, Database, FlaskConical } from 'lucide-vue-next'
+import { BarChart3, Play, Loader2, ExternalLink, Database, FlaskConical, Download } from 'lucide-vue-next'
 import { runScreen, type ScreenItem, type ScreenPayload } from '../services/analytics'
 import { syncBatchToVnpy } from '../services/market'
+import { downloadCsv } from '../utils/csvExport'
 
 const router = useRouter()
 
@@ -63,6 +64,27 @@ function goBacktest() {
     path: '/strategies',
     query: { vtSymbol: '', start: '', end: '', screen: '1' },
   })
+}
+
+function exportCsv() {
+  const items = data.value?.items ?? []
+  if (!items.length) return
+  downloadCsv(
+    `factor_screen_${new Date().toISOString().slice(0, 10)}.csv`,
+    ['ts_code', 'name', 'vt_symbol', 'close', 'score', 'mom_pct', 'trend_pct', 'volatility_pct', 'vol_ratio', 'drawdown_pct'],
+    items.map((it) => [
+      it.ts_code,
+      it.name,
+      it.vt_symbol,
+      it.close,
+      it.score,
+      it.factors.mom,
+      it.factors.trend,
+      it.factors.volatility,
+      it.factors.vol_ratio,
+      it.factors.drawdown_from_high,
+    ]),
+  )
 }
 
 function fmtPct(v: number | undefined) {
@@ -134,6 +156,10 @@ onMounted(() => {
             <Loader2 v-if="syncing" class="ic spin" />
             <Database v-else class="ic" />
             {{ syncing ? '同步中…' : '批量同步到本地库' }}
+          </button>
+          <button class="btn" @click="exportCsv">
+            <Download class="ic" />
+            导出 CSV
           </button>
           <button
             v-if="syncedCodes.length"

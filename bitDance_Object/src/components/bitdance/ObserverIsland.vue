@@ -33,6 +33,7 @@ const toolNav = [
   { label: '组合回测', to: '/analytics/portfolio' },
   { label: '纸面交易', to: '/analytics/paper' },
   { label: '实时行情', to: '/analytics/realtime' },
+  { label: '市场热力图', to: '/analytics/heatmap' },
 ] as const
 
 function isActive(path: string) {
@@ -44,6 +45,7 @@ function isActive(path: string) {
   if (path === '/analytics/realtime') return route.path.startsWith('/analytics/realtime')
   if (path === '/analytics/portfolio') return route.path.startsWith('/analytics/portfolio')
 if (path === '/analytics/paper') return route.path.startsWith('/analytics/paper')
+if (path === '/analytics/heatmap') return route.path.startsWith('/analytics/heatmap')
   return route.path === path
 }
 function closeMenu() {

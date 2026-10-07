@@ -899,3 +899,88 @@ def paper_trade(body: PaperRequest):
         "capital": body.capital,
         "message": f"最新持仓: { {1:'多',-1:'空',0:'空仓'}[position] } · 浮动 {round(unrealized,2) if unrealized is not None else 0}% · 信号 {len(signals)} 次",
     }
+
+
+# ---- 全市场涨跌热力图 ----
+
+
+class HeatmapRequest(BaseModel):
+    sample: int = Field(900, ge=100, le=1500, description="取样股票数量（请求批次数）")
+    end_date: str | None = None
+
+
+@router.post("/heatmap")
+def market_heatmap(body: HeatmapRequest):
+    """全市场涨跌热力图：批量拉取实时快照，按涨跌幅分桶 + 尾部聚合。
+
+    腾讯实时接口无稳定行业字段，这里按"涨跌幅格子"输出，颜色编码涨跌，
+    直观展示市场广度（上涨家数/下跌家数/平盘）。
+    """
+    from routers.free_market import _fetch_quotes
+
+    try:
+        stocks = free_list()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"获取股票列表失败: {e}") from e
+    if stocks is None or stocks.empty:
+        raise HTTPException(status_code=502, detail="股票列表为空")
+
+    # 取样：全市场均匀取前 N 只（免费接口一次性批量拉，控制请求量）
+    df = stocks.head(body.sample)
+    tx_codes = []
+    from routers.free_market import vt_to_tx
+
+    for _, r in df.iterrows():
+        code = str(r.get("ts_code", "")).upper()
+        if "." in code:
+            try:
+                tx_codes.append(vt_to_tx(code))
+            except Exception:
+                continue
+
+    try:
+        quotes = _fetch_quotes(tx_codes, batch=300)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"实时快照获取失败: {e}") from e
+    if quotes is None or quotes.empty:
+        raise HTTPException(status_code=502, detail="无实时快照")
+
+    # 分桶：<=-7, -7~-4, -4~-2, -2~0, 0, 0~2, 2~4, 4~7, >=7
+    buckets = [
+        {"label": "≤-7%", "min": -999, "max": -7, "count": 0},
+        {"label": "-7~-4%", "min": -7, "max": -4, "count": 0},
+        {"label": "-4~-2%", "min": -4, "max": -2, "count": 0},
+        {"label": "-2~0%", "min": -2, "max": 0, "count": 0},
+        {"label": "0%", "min": 0, "max": 0, "count": 0},
+        {"label": "0~2%", "min": 0, "max": 2, "count": 0},
+        {"label": "2~4%", "min": 2, "max": 4, "count": 0},
+        {"label": "4~7%", "min": 4, "max": 7, "count": 0},
+        {"label": "≥7%", "min": 7, "max": 999, "count": 0},
+    ]
+
+    items = []
+    up = down = flat = 0
+    for _, row in quotes.iterrows():
+        pct = float(row.get("change_pct", 0) or 0)
+        code = str(row.get("ts_code", ""))
+        name = str(row.get("name", ""))
+        items.append({"ts_code": code, "name": name, "pct": round(pct, 2), "now": float(row.get("now", 0) or 0)})
+        if pct > 0:
+            up += 1
+        elif pct < 0:
+            down += 1
+        else:
+            flat += 1
+        for b in buckets:
+            if b["min"] <= pct < b["max"] if b["max"] != 0 else b["min"] <= pct <= b["max"]:
+                b["count"] += 1
+                break
+
+    return {
+        "success": True,
+        "sample": len(items),
+        "items": items,
+        "buckets": buckets,
+        "breadth": {"up": up, "down": down, "flat": flat},
+        "message": f"取样 {len(items)} 只：上涨 {up} · 下跌 {down} · 平盘 {flat}",
+    }

@@ -118,6 +118,12 @@ const router = createRouter({
       component: () => import('../views/PaperTradingView.vue'),
       meta: { title: '纸面交易' },
     },
+    {
+      path: '/analytics/heatmap',
+      name: 'heatmap',
+      component: () => import('../views/HeatmapView.vue'),
+      meta: { title: '市场热力图' },
+    },
   ],
   scrollBehavior(to, _from, saved) {
     if (saved) return saved

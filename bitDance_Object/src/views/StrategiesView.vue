@@ -586,6 +586,11 @@ function formatMoney(value?: number) {
   return `¥${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
 }
 
+function fmtDt(s: string | undefined) {
+  if (!s) return '--'
+  return s.length > 10 ? s.slice(0, 16).replace('T', ' ') : s
+}
+
 function formatTradeAction(action: string | undefined, fallbackSide: string) {
   if (action === 'buy_open') return '开多(买入)'
   if (action === 'buy_close') return '平空(买入)'
@@ -675,6 +680,43 @@ function formatTradeAction(action: string | undefined, fallbackSide: string) {
       <div class="chart-wrap">
         <VChart ref="ddChartRef" class="chart chart-sub" :option="drawdownChartOption" autoresize />
       </div>
+    </section>
+
+    <section v-if="result?.trade_rounds?.length" class="card trades-card">
+      <h2>交易明细（完整回合）</h2>
+      <div class="trades-table-wrap">
+        <table class="trades-table">
+          <thead>
+            <tr>
+              <th class="left">方向</th>
+              <th>开仓时间</th>
+              <th>开仓价</th>
+              <th>平仓时间</th>
+              <th>平仓价</th>
+              <th>持仓天数</th>
+              <th>数量</th>
+              <th>盈亏</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(r, i) in result.trade_rounds" :key="i">
+              <td class="left" :class="r.side === 'long' ? 'up' : 'down'">
+                {{ r.side === 'long' ? '多' : '空' }}
+              </td>
+              <td class="mono">{{ fmtDt(r.entry_datetime) }}</td>
+              <td class="mono">{{ r.entry_price.toFixed(2) }}</td>
+              <td class="mono">{{ fmtDt(r.exit_datetime) }}</td>
+              <td class="mono">{{ r.exit_price.toFixed(2) }}</td>
+              <td>{{ r.holding_days }}</td>
+              <td class="mono">{{ r.volume }}</td>
+              <td class="mono" :class="r.gross_pnl_approx >= 0 ? 'up' : 'down'">
+                {{ r.gross_pnl_approx >= 0 ? '+' : '' }}{{ r.gross_pnl_approx.toFixed(2) }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="trades-tip">按"多/空开仓 → 平仓"配对的一个完整回合；盈亏为近似值（未区分手续费/滑点明细）。</p>
     </section>
 
     <Teleport to="body">
@@ -866,5 +908,43 @@ function formatTradeAction(action: string | undefined, fallbackSide: string) {
 .share-confirm:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.trades-card {
+  margin-top: 1rem;
+}
+.trades-table-wrap {
+  overflow-x: auto;
+}
+.trades-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.trades-table th,
+.trades-table td {
+  padding: 0.4rem 0.55rem;
+  border-bottom: 1px solid rgba(169, 190, 221, 0.12);
+  color: var(--bq-text);
+  text-align: right;
+  white-space: nowrap;
+}
+.trades-table th.left,
+.trades-table td.left {
+  text-align: left;
+}
+.trades-table .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.trades-table .up {
+  color: #ef7d7d;
+}
+.trades-table .down {
+  color: #57d991;
+}
+.trades-tip {
+  margin: 0.6rem 0 0;
+  font-size: 0.74rem;
+  color: var(--bq-muted);
 }
 </style>
