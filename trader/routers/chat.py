@@ -1,12 +1,14 @@
 # routers/chat.py
 import os
 import uuid
+import logging
 from openai import AsyncOpenAI
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
-
 import ai.config as config
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -141,7 +143,7 @@ async def chat(request: ChatRequest):
 
     # 4. 提取助手回复
     assistant_message = completion.choices[0].message
-    print(assistant_message)
+    logger.debug("chat reply: %s", assistant_message)
     assistant_content = assistant_message.content
     usage = completion.usage.model_dump() if completion.usage else None
 

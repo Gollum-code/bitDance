@@ -1,23 +1,32 @@
 # bitDance
 
-> 基于 vn.py 开发的量化交易系统（量化研究、回测与交易服务实践项目）
+> **基于 vn.py 的量化交易研究与回测平台** —— 从策略研究、回测验证到组合分析的一站式实践项目。
 
 ## 项目简介
 
-`bitDance` 是一个以 **Python + vn.py** 为核心、并结合 **FastAPI** 与 **Vue 3 + Vite** 的量化交易实践项目。  
-项目包含策略研究与回测示例、后端 API 服务、前端可视化页面等模块，适合用于：
+`bitDance` 以 **Python + vn.py** 量化引擎为核心，搭配 **FastAPI** 双服务与 **Vue 3 + TypeScript** 前端，构建了一个覆盖「**行情 → 策略 → 回测 → 分析 → 社区**」完整链路的量化交易实践系统。
 
-- 量化策略学习与验证
-- 交易系统原型开发
-- 前后端联调与功能扩展
+### 核心能力
 
-## 技术栈
+- **策略研究**：将聚宽社区 99 份策略模板去重改写为 **23 个 vn.py `CtaTemplate` 策略族**（均线 / MACD / RSRS / 布林 / 海龟 / 机器学习等），配套族参数映射与公共指标库
+- **真实回测**：基于 vn.py `BacktestingEngine` 的日线回测，输出收益曲线、回撤、夏普、胜率、交易明细等完整指标
+- **多维分析**：多策略对比、因子选股、参数网格优化（单参数 + 双因子热力图）、组合回测、纸面交易、市场热力图
+- **免费行情**：腾讯公开接口（免 token）提供全市场列表、日线、分钟线与实时快照，支持 TuShare 切换
+- **智能辅助**：Kimi 驱动的回测报告生成、报告对比、AI 问答
+- **社区生态**：帖子 / 点赞 / 评论，策略回测结果可一键分享
+- **工程化**：GitHub Actions CI（后端 / 回测 / 前端三 job）、pytest 测试、一键启动脚本
 
-- **量化/后端**：Python、vn.py、FastAPI、Uvicorn、SQLite
-- **前端**：Vue 3、TypeScript、Vite、Tailwind CSS、ECharts
-- **测试/持续集成**：pytest（后端接口 + 回测引擎）、GitHub Actions
+### 技术栈
 
-> 仓库以 Python 为主（约 150 个 `.py`），前端 Vue/TS 约 40 个文件，另含策略改写清单 CSV 与少量 Notebook 示例。
+| 层 | 技术 |
+| --- | --- |
+| 量化引擎 | Python、vn.py、vnpy_ctastrategy |
+| 后端服务 | FastAPI、Uvicorn、SQLite（双服务 8000 / 8080） |
+| 前端 | Vue 3、TypeScript、Vite、Tailwind CSS、ECharts |
+| 数据源 | 腾讯公开行情（免费）/ TuShare（可选） |
+| 测试 / CI | pytest、GitHub Actions |
+
+> 仓库规模：约 **149 个 Python 文件**、**27 个 Vue 组件**、**22 个前端路由**，含策略改写清单与完整文档。
 
 ## 仓库结构（按当前项目整理）
 
@@ -27,21 +36,22 @@ bitDance/
 ├─ start-all.ps1                          # 一键启动脚本（前端 + 8080 + 8000）
 ├─ .github/workflows/ci.yml               # CI：后端/回测/前端 三 job
 ├─ trader/                                # 交易与策略服务（FastAPI 8000）
-│  ├─ main.py                             # 服务入口，注册 /strategy /chat /api/market
+│  ├─ main.py                             # 服务入口，注册 /strategy /chat /api/market /analytics
 │  ├─ routers/
 │  │  ├─ free_market.py                   # 免费行情源（腾讯公开接口，免 token）
-│  │  ├─ market_data.py                   # 行情 API，DATA_SOURCE 切换 free/tushare
+│  │  ├─ market_data.py                   # 行情 API（日线/分钟线/批量同步），DATA_SOURCE 切换
 │  │  ├─ tushare_bars.py / tushareStaticsUploud.py  # 写入 vn.py 数据库 / CSV 导入
 │  │  ├─ chooseStrategy.py                # /strategy/list、/strategy/{id}（回测）
+│  │  ├─ analytics.py                     # 多策略对比/因子选股/网格优化/组合回测/纸面交易/热力图/WS 推送
 │  │  └─ chat.py                          # Kimi 智能助手（Moonshot API）
 │  ├─ examples/cta_backtesting/           # ★ 策略改写与回测模块
 │  │  ├─ rewritten_strategies/            # 23 个族策略 + manifest.csv + 工具函数
 │  │  └─ run_rewritten_strategy_backtest.py
-│  └─ tests/                              # 回测引擎 pytest（7 个用例）
+│  └─ tests/                              # 回测引擎 + 分析功能 pytest（21 个用例）
 └─ bitDance_Object/
    ├─ package.json                        # 前端依赖与脚本
    ├─ vite.config.ts                      # 代理：/strategy /chat /api/market→8000，/api→8080
-   ├─ src/                                # Vue 3 页面与组件
+   ├─ src/                                # Vue 3 页面与组件（22 个路由）
    └─ backend/
       ├─ main.py                          # 业务后端服务入口（8080，约 25 个 API）
       ├─ requirements.txt                 # 后端 Python 依赖
@@ -56,8 +66,9 @@ bitDance/
 - 使用 FastAPI 启动 API 服务（默认 `0.0.0.0:8000`）
 - 已注册路由：
   - `/strategy/list`、`/strategy/{id}`：策略清单与真实 vn.py 回测
+  - `/analytics/*`：多策略对比、因子选股、参数网格优化、组合回测、纸面交易、市场热力图、实时行情（含 WebSocket 推送）
   - `/chat/*`：Kimi 智能对话（需 `MOONSHOT_API_KEY`）
-  - `/api/market/*`：行情（股票列表/日线/分钟线/同步 vn.py）
+  - `/api/market/*`：行情（股票列表/日线/分钟线/同步 vn.py/批量同步）
   - `/upload/csv`：tushare 格式日线 CSV 导入 vn.py 数据库
 - 行情数据源通过 `DATA_SOURCE` 切换：`free`（默认，腾讯公开接口免 token）或 `tushare`（付费，需 token）
 
@@ -87,8 +98,8 @@ bitDance/
   - `rewritten_strategies/_family_helpers.py`：族策略公共指标库（zscore/RSRS/KDJ/GFTD/ATR 等）
   - `rewritten_strategies/manifest.csv`：99 份模板 → 族策略类 + 默认参数的映射
   - `rewritten_strategies/_archived_v1/`：早期一次性生成的 100 份近似重复策略（已归档）
-  - `run_rewritten_strategy_backtest.py`：按 manifesto 加载族策略并回测的引擎入口
-- 策略来源模板：`D:\量化交易\量化投资策略源码模型多因子短线量化交易策略方法分析电子版模板\量化投资策略源码模型多因子短线量化交易策略方法分析电子版模板\量化策略代码(99份)\`（聚宽社区 99 份 `.txt`）
+  - `run_rewritten_strategy_backtest.py`：按 manifest 加载族策略并回测的引擎入口
+- 策略来源：聚宽社区 99 份策略模板（`.txt`），改写清单见 `rewritten_strategies/manifest.csv`
 
 > **注意**：原始 33 份"向导式"模板是同一套聚宽向导框架的参数化副本，改写时已归并为
 > `FamilyWizard` 一个族；其余 66 份按所选策略逻辑（均线/MACD/RSRS/布林/海龟/机器学习等）

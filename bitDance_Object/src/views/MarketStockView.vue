@@ -92,6 +92,17 @@ function bollArr(closes: number[], window = 20): { mid: (number | null)[]; upper
   return { mid, upper, lower }
 }
 
+// 指标缓存：仅在日线数据变化时重算，切换副图指示器不再重复计算
+const closesOfBars = computed(() => (payload.value?.bars ?? []).map((b) => b.close))
+const bollCache = computed(() => bollArr(closesOfBars.value, 20))
+const macdCache = computed(() => macdArr(closesOfBars.value))
+const maCache = computed(() => [
+  { name: 'MA5', data: smaArr(closesOfBars.value, 5), color: '#f59e0b' },
+  { name: 'MA10', data: smaArr(closesOfBars.value, 10), color: '#22d3ee' },
+  { name: 'MA20', data: smaArr(closesOfBars.value, 20), color: '#a78bfa' },
+  { name: 'MA60', data: smaArr(closesOfBars.value, 60), color: '#f472b6' },
+])
+
 const chartOption = computed<EChartsOption>(() => {
   const bars = payload.value?.bars ?? []
   if (bars.length === 0) {
@@ -108,15 +119,9 @@ const chartOption = computed<EChartsOption>(() => {
   const dates = bars.map((b) => b.date)
   const candle = bars.map((b) => [b.open, b.close, b.low, b.high] as [number, number, number, number])
   const vol = bars.map((b) => b.vol)
-  const closes = bars.map((b) => b.close)
 
-  // 均线叠加（主图）
-  const maSeries = [
-    { name: 'MA5', data: smaArr(closes, 5), color: '#f59e0b' },
-    { name: 'MA10', data: smaArr(closes, 10), color: '#22d3ee' },
-    { name: 'MA20', data: smaArr(closes, 20), color: '#a78bfa' },
-    { name: 'MA60', data: smaArr(closes, 60), color: '#f472b6' },
-  ]
+  // 均线叠加（主图）—— 来自缓存，仅在 bars 变化时重算
+  const maSeries = maCache.value
     .map((s) => ({
       name: s.name,
       type: 'line' as const,
@@ -204,9 +209,9 @@ const chartOption = computed<EChartsOption>(() => {
     ...maSeries,
   ]
 
-  // 指标副图系列
+  // 指标副图系列（来自缓存）
   if (indicator.value === 'boll') {
-    const b = bollArr(closes, 20)
+    const b = bollCache.value
     legendData.push('BOLL 上', 'BOLL 中', 'BOLL 下')
     series.push(
       { name: 'BOLL 上', type: 'line', data: b.upper, smooth: true, showSymbol: false, lineStyle: { width: 1, color: 'rgba(240,180,41,.6)' }, emphasis: { disabled: true } },
@@ -214,7 +219,7 @@ const chartOption = computed<EChartsOption>(() => {
       { name: 'BOLL 下', type: 'line', data: b.lower, smooth: true, showSymbol: false, lineStyle: { width: 1, color: 'rgba(240,180,41,.6)' }, emphasis: { disabled: true } },
     )
   } else if (indicator.value === 'macd') {
-    const m = macdArr(closes)
+    const m = macdCache.value
     legendData.push('MACD DIF', 'MACD DEA', 'MACD 柱')
     series.push(
       {
@@ -334,6 +339,7 @@ const minuteOption = computed<EChartsOption>(() => {
 async function loadMinute() {
   if (!tsCode.value) return
   minuteLoading.value = true
+  errorMessage.value = ''
   try {
     minutePayload.value = await getMarketMinute(tsCode.value, minutePeriod.value, 320)
   } catch (e) {

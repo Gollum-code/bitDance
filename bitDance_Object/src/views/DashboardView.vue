@@ -107,6 +107,7 @@ const searchErr = ref('')
 async function loadQuotes() {
   const rows: WatchQuote[] = []
   const names = stockNames.value
+  let failed = 0
   for (const code of watchlist.value) {
     try {
       const today = new Date()
@@ -114,7 +115,10 @@ async function loadQuotes() {
       const start = new Date(today.getTime() - 90 * 86400000).toISOString().slice(0, 10)
       const d = await getMarketDaily(code, start, end)
       const bars: DailyBar[] = d.bars ?? []
-      if (!bars.length) continue
+      if (!bars.length) {
+        failed += 1
+        continue
+      }
       const last = bars[bars.length - 1]
       const prev = bars.length > 1 ? bars[bars.length - 2] : last
       const prevClose = prev?.close ?? last.close
@@ -130,10 +134,15 @@ async function loadQuotes() {
         amount: last.amount,
       })
     } catch {
-      /* skip */
+      failed += 1
     }
   }
   quotes.value = rows
+  if (!rows.length && failed > 0) {
+    errorText.value = '行情加载失败，请确认 trader 服务（8000）已启动，或稍后重试。'
+  } else {
+    errorText.value = ''
+  }
 }
 
 async function doSearch() {

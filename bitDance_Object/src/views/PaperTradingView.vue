@@ -48,6 +48,24 @@ function unrealClass(v: number) {
   return 'flat'
 }
 
+function sigText(s: { side: string; is_open?: boolean }) {
+  if (s.side === 'buy') return '开多'
+  if (s.side === 'short') return '开空'
+  if (s.side === 'sell') return '平多'
+  if (s.side === 'cover') return '平空'
+  return s.side
+}
+
+function sigClass(s: { side: string; is_open?: boolean }) {
+  return s.is_open ? 'long' : 'flat'
+}
+
+function roundClass(v: number) {
+  if (v > 0) return 'profit'
+  if (v < 0) return 'loss'
+  return 'flat'
+}
+
 onMounted(async () => {
   try {
     strategies.value = await listStrategies()
@@ -123,8 +141,15 @@ onMounted(async () => {
               {{ data.latest_price.toFixed(2) }}（{{ data.unrealized_pct > 0 ? '+' : '' }}{{ data.unrealized_pct.toFixed(2) }}%）
             </span>
           </div>
+          <div class="stat">
+            <span class="stat-label">完整回合 / 胜率</span>
+            <span class="stat-val">
+              {{ data.round_count ?? 0 }}
+              <template v-if="data.win_rate != null">（{{ data.win_rate.toFixed(1) }}%）</template>
+            </span>
+          </div>
         </div>
-        <p class="hint">策略参数：{{ Object.entries(data.params_used ?? {}).map(([k, v]) => `${k}=${v}`).join(' · ') || '默认' }}</p>
+        <p class="hint">基于真实策略回测成交推导：持仓 = 最后一笔未平仓交易。策略参数：{{ Object.entries(data.params_used ?? {}).map(([k, v]) => `${k}=${v}`).join(' · ') || '默认' }}</p>
       </section>
 
       <section class="panel">
@@ -134,23 +159,55 @@ onMounted(async () => {
             <thead>
               <tr>
                 <th class="left">日期</th>
-                <th>信号</th>
-                <th>触发价</th>
-                <th>方向</th>
+                <th>类型</th>
+                <th>成交价</th>
+                <th>持仓后</th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="s in [...data.signals].reverse()" :key="s.date + s.price">
+              <tr v-for="s in [...data.signals].reverse()" :key="s.date + s.price + s.volume">
                 <td class="left">{{ s.date }}</td>
                 <td>
-                  <span :class="s.side === 'buy' ? 'long' : 'short'">{{ s.side === 'buy' ? '做多' : '做空' }}</span>
+                  <span :class="sigClass(s)">{{ sigText(s) }}</span>
                 </td>
                 <td>{{ s.price.toFixed(2) }}</td>
-                <td>{{ s.position_after > 0 ? '多' : '空' }}</td>
+                <td>{{ s.position_after > 0 ? '持多' : s.position_after < 0 ? '持空' : '空仓' }}</td>
               </tr>
             </tbody>
           </table>
           <p v-if="!data.signals.length" class="muted-cell">暂无信号区间内（可能策略参数与行情不匹配）</p>
+        </div>
+      </section>
+
+      <section v-if="data.closed_rounds?.length" class="panel">
+        <h2 class="h2">完整回合（{{ data.closed_rounds.length }}/{{ data.round_count }}）</h2>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th class="left">方向</th>
+                <th>开仓</th>
+                <th>开仓价</th>
+                <th>平仓</th>
+                <th>平仓价</th>
+                <th>收益率</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(r, i) in [...data.closed_rounds].reverse()" :key="i">
+                <td class="left" :class="r.side === 'long' ? 'long' : 'short'">
+                  {{ r.side === 'long' ? '多' : '空' }}
+                </td>
+                <td class="mono">{{ r.entry_date ?? '—' }}</td>
+                <td class="mono">{{ r.entry_price.toFixed(2) }}</td>
+                <td class="mono">{{ r.exit_date }}</td>
+                <td class="mono">{{ r.exit_price.toFixed(2) }}</td>
+                <td class="mono" :class="roundClass(r.return_pct)">
+                  {{ r.return_pct > 0 ? '+' : '' }}{{ r.return_pct.toFixed(2) }}%
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </section>
     </template>

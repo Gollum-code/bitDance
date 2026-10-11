@@ -25,6 +25,7 @@ from examples.cta_backtesting.run_rewritten_strategy_backtest import (
     DEFAULT_CONFIG,
     build_setting,
     load_strategy_class,
+    main as _run_backtest_main,
 )
 from routers.free_market import fetch_daily as free_daily
 from routers.free_market import fetch_stock_list as free_list
@@ -798,10 +799,13 @@ class PaperRequest(BaseModel):
 
 @router.post("/paper")
 def paper_trade(body: PaperRequest):
-    """纸面交易：用策略信号逻辑在最新日线上模拟持仓，输出持仓/成本/浮动盈亏/信号历史。
+    """纸面交易：用**真实回测成交记录**推导当前持仓状态。
 
-    方案：拉取该标的最近日线 → 用族策略参数计算信号（不做完整回测，只评估最新持仓状态），
-    从信号的最后一笔触发点起模拟成本与浮动盈亏。适合快速看"如果现在按该策略持仓会怎样"。
+    流程：
+      1. 确认该标的日线已在 vn.py 本地库（缺失则自动从免费源同步）
+      2. 在最近 lookback 天窗口内运行真实策略回测
+      3. 遍历成交记录，找出最后一笔未平仓交易 → 当前持仓方向 / 进场成本 / 浮动盈亏
+      4. 信号历史取自真实成交（开仓=买入信号，平仓=卖出信号）
     """
     import sys as _sys
 
@@ -815,69 +819,126 @@ def paper_trade(body: PaperRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"策略加载失败: {e}") from e
 
-    overrides = dict(body.fixed_params or {})
-    setting = build_setting(strategy_cls, row, overrides)
-
     end_d = pd.Timestamp.today().normalize()
     start_d = (end_d - pd.Timedelta(days=int(body.lookback * 2.0))).strftime("%Y-%m-%d")
-    df = _load_daily_df(body.vt_symbol, start_d, end_d.strftime("%Y-%m-%d"))
+
+    # 1) 确保本地库有数据：优先免费源，拿到就写入 vn.py 数据库
+    end_str = end_d.strftime("%Y-%m-%d")
+    df = _load_daily_df(body.vt_symbol, start_d, end_str)
     if df is None or len(df) < 40:
-        raise HTTPException(status_code=404, detail="本地库/免费源均无该标的足够日线，请先同步行情")
+        raise HTTPException(status_code=404, detail="免费源/本地库均无该标的足够日线，请稍后重试或更换标的")
+    try:
+        from routers.tushare_bars import bars_from_tushare_daily_df, save_bars_to_database
 
-    df = df.sort_values("trade_date").reset_index(drop=True)
-    close = df["close"].astype(float).to_numpy()
-    high = df["high"].astype(float).to_numpy()
-    low = df["low"].astype(float).to_numpy()
-    dates = df["trade_date"].tolist()
+        save_bars_to_database(bars_from_tushare_daily_df(df.sort_values("trade_date")))
+    except Exception:
+        pass  # 写入失败不阻断（可能已存在）
 
-    # 用族策略的公开信号方法（on_bar 简化）：若策略有 get_signal 辅助则用，否则用通用均线逻辑
-    from rewritten_strategies import _family_helpers as fh
+    # 2) 真实回测
+    overrides = dict(body.fixed_params or {})
+    setting = build_setting(strategy_cls, row, overrides)
+    cfg = {
+        "strategy_id": sid,
+        "vt_symbol": body.vt_symbol,
+        "start": start_d,
+        "end": end_str,
+        "capital": body.capital,
+    }
+    cfg.update(overrides)
 
-    fast = int(setting.get("fast_window", 5) or 5)
-    slow = int(setting.get("slow_window", 20) or 20)
-    fast_ma = fh.sma_series(close, fast)
-    slow_ma = fh.sma_series(close, slow)
+    try:
+        stats, result_df, trades = _run_backtest_main(cfg)
+    except Exception as e:
+        logger.exception("纸面交易回测失败")
+        raise HTTPException(status_code=500, detail=f"回测执行失败: {e}") from e
 
-    # 逐根生成信号：快线上穿慢线=多，下穿=空
-    signals: list[dict] = []
+    trade_list = list(trades.values()) if isinstance(trades, dict) else list(trades or [])
+    if not trade_list:
+        raise HTTPException(
+            status_code=404,
+            detail="该策略在最近区间没有触发任何交易（成交笔数为 0），无法推导持仓。请调整参数或更换标的/区间。",
+        )
+
+    # 3) 遍历成交，推导当前持仓
+    from vnpy.trader.constant import Direction, Offset
+
     position = 0  # 1 多 / -1 空 / 0 空仓
-    last_entry_idx = None
+    entry_dt = None
     entry_price = None
-    entry_date = None
-    prev_cross = 0.0
-    for i in range(len(close)):
-        if i < 1 or fast_ma[i] == 0 or slow_ma[i] == 0:
+    signals: list[dict] = []
+    closed_rounds: list[dict] = []
+
+    for t in trade_list:
+        dt = getattr(t, "datetime", None)
+        direction = getattr(t, "direction", None)
+        offset = getattr(t, "offset", None)
+        price = float(getattr(t, "price", 0) or 0)
+        volume = float(getattr(t, "volume", 0) or 0)
+        if not dt or direction is None or offset is None:
             continue
-        f, s = fast_ma[i], slow_ma[i]
-        cross = 1.0 if f > s else (-1.0 if f < s else 0.0)
-        if prev_cross != 0 and cross != prev_cross:
-            # 交叉触发
+        is_open = offset == Offset.OPEN
+        is_long = direction == Direction.LONG
+        d_str = dt.strftime("%Y-%m-%d")
+
+        if is_open:
+            position = 1 if is_long else -1
+            entry_dt = d_str
+            entry_price = price
             signals.append({
-                "date": str(dates[i]),
-                "price": round(float(close[i]), 3),
-                "side": "buy" if cross > 0 else "short",
-                "position_after": 1 if cross > 0 else -1,
+                "date": d_str,
+                "price": round(price, 3),
+                "side": "buy" if is_long else "short",
+                "position_after": position,
+                "volume": volume,
+                "is_open": True,
             })
-            position = 1 if cross > 0 else -1
-            last_entry_idx = i
-            entry_price = float(close[i])
-            entry_date = str(dates[i])
-        prev_cross = cross
+        else:
+            if position != 0 and entry_price:
+                pnl_pct = ((price - entry_price) / entry_price * 100) if position > 0 else ((entry_price - price) / entry_price * 100)
+                closed_rounds.append({
+                    "side": "long" if position > 0 else "short",
+                    "entry_date": entry_dt,
+                    "entry_price": entry_price,
+                    "exit_date": d_str,
+                    "exit_price": price,
+                    "return_pct": round(pnl_pct, 3),
+                })
+            signals.append({
+                "date": d_str,
+                "price": round(price, 3),
+                "side": "sell" if is_long else "cover",
+                "position_after": 0,
+                "volume": volume,
+                "is_open": False,
+            })
+            position = 0
+            entry_dt = None
+            entry_price = None
 
-    # 当前持仓状态
-    latest_price = float(close[-1])
-    unrealized = None
+    # 4) 最新价与浮动盈亏
+    close = df.sort_values("trade_date")["close"].astype(float)
+    latest_price = float(close.iloc[-1]) if len(close) else 0.0
+    unrealized = 0.0
     if position != 0 and entry_price:
-        unrealized = (latest_price - entry_price) / entry_price * 100 if position > 0 else (entry_price - latest_price) / entry_price * 100
+        unrealized = ((latest_price - entry_price) / entry_price * 100) if position > 0 else ((entry_price - latest_price) / entry_price * 100)
 
-    # 模拟权益曲线：以最近 N 日价格变化估算（无持仓时为现金）
-    nav = [1.0]
-    if position != 0 and entry_price and last_entry_idx is not None:
-        for i in range(last_entry_idx, len(close)):
-            r = (close[i] - entry_price) / entry_price if position > 0 else (entry_price - close[i]) / entry_price
-            nav.append(1.0 + r)
+    # 真实权益曲线
+    nav: list[float] = []
+    nav_dates: list[str] = []
+    if result_df is not None and not result_df.empty and "balance" in result_df.columns:
+        base = float(result_df["balance"].iloc[0]) or 1.0
+        for idx, val in result_df["balance"].items():
+            nav.append(round(float(val) / base, 6))
+            nav_dates.append(idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx))
+
+    win_rounds = [r for r in closed_rounds if r["return_pct"] > 0]
+    pos_text = {1: "多", -1: "空", 0: "空仓"}.get(position)
+    if closed_rounds:
+        round_desc = (
+            f"区间 {len(closed_rounds)} 个完整回合（胜率 {round(len(win_rounds) / len(closed_rounds) * 100, 1)}%）"
+        )
     else:
-        nav = [1.0, 1.0]
+        round_desc = "区间内尚未出现完整平仓回合"
 
     return {
         "success": True,
@@ -885,19 +946,24 @@ def paper_trade(body: PaperRequest):
         "class_name": row["class_name"],
         "archetype": row["archetype"],
         "vt_symbol": body.vt_symbol,
-        "position": {1: "多", -1: "空", 0: "空仓"}.get(position),
+        "position": pos_text,
         "position_code": position,
-        "entry_date": entry_date,
+        "entry_date": entry_dt,
         "entry_price": entry_price,
         "latest_price": latest_price,
-        "unrealized_pct": round(unrealized, 3) if unrealized is not None else 0.0,
+        "unrealized_pct": round(unrealized, 3),
         "signal_count": len(signals),
-        "signals": signals[-12:],  # 最近 12 个信号
-        "params_used": {k: setting.get(k) for k in ("fast_window", "slow_window", "fixed_size") if setting.get(k) is not None},
-        "dates": [str(d) for d in dates[-(len(nav)):]],
-        "nav": [round(v, 6) for v in nav],
+        "signals": signals[-12:],
+        "closed_rounds": closed_rounds[-12:],
+        "round_count": len(closed_rounds),
+        "win_rate": (len(win_rounds) / len(closed_rounds) * 100) if closed_rounds else None,
+        "params_used": {k: v for k, v in setting.items() if isinstance(v, (int, float))},
+        "dates": nav_dates,
+        "nav": nav,
         "capital": body.capital,
-        "message": f"最新持仓: { {1:'多',-1:'空',0:'空仓'}[position] } · 浮动 {round(unrealized,2) if unrealized is not None else 0}% · 信号 {len(signals)} 次",
+        "message": (
+            f"当前{pos_text} · 浮动 {round(unrealized, 2)}% · {round_desc}"
+        ),
     }
 
 

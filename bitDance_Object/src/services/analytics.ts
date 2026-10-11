@@ -121,8 +121,19 @@ export interface PortfolioSymbolResult {
 export interface PaperSignal {
   date: string
   price: number
-  side: 'buy' | 'short'
+  side: string
   position_after: number
+  volume?: number
+  is_open?: boolean
+}
+
+export interface PaperRound {
+  side: 'long' | 'short'
+  entry_date: string | null
+  entry_price: number
+  exit_date: string
+  exit_price: number
+  return_pct: number
 }
 
 export interface HeatmapBucket {
@@ -162,6 +173,9 @@ export interface PaperPayload {
   unrealized_pct: number
   signal_count: number
   signals: PaperSignal[]
+  closed_rounds?: PaperRound[]
+  round_count?: number
+  win_rate?: number | null
   params_used?: Record<string, unknown>
   dates: string[]
   nav: number[]
