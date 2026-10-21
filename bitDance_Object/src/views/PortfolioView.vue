@@ -115,13 +115,15 @@ async function run() {
   loading.value = true
   err.value = ''
   try {
+    // 按目标名义金额定仓：权重 × 组合资金。
+    // 不能用固定股数——一篮子标的价格可能差 300 倍，固定股数会让实际权重严重偏离设定权重。
     data.value = await runPortfolio({
       strategy_id: sid.value,
       vt_symbols: symbols.value.map((s) => s.trim()).filter(Boolean),
-      weights: weights.value,
       start: start.value,
       end: end.value,
       capital: capital.value,
+      notional_per_symbol: weights.value.map((w) => (Number.isFinite(w) ? w : 0) * capital.value),
     })
   } catch (e) {
     err.value = e instanceof Error ? e.message : '组合回测失败'
@@ -235,7 +237,9 @@ onMounted(async () => {
               <tr>
                 <th class="left">标的</th>
                 <th>权重</th>
-                <th>单标的收益 %</th>
+                <th>名义金额</th>
+                <th>股数</th>
+                <th>收益贡献 %</th>
                 <th>成交笔数</th>
                 <th>状态</th>
               </tr>
@@ -244,12 +248,15 @@ onMounted(async () => {
               <tr v-for="p in data.per_symbol" :key="p.vt_symbol">
                 <td class="left">{{ p.vt_symbol }}</td>
                 <td>{{ ((data.weights?.find((w) => w.vt_symbol === p.vt_symbol)?.weight ?? 0) * 100).toFixed(0) }}%</td>
+                <td>{{ p.target_notional === null || p.target_notional === undefined ? '—' : fmtNum(p.target_notional, 0) }}</td>
+                <td>{{ p.fixed_size === null || p.fixed_size === undefined ? '—' : fmtNum(p.fixed_size, 0) }}</td>
                 <td>{{ p.ok ? fmtNum(p.total_return) : '—' }}</td>
                 <td>{{ p.ok ? p.trade_count : '—' }}</td>
                 <td>{{ p.ok ? '✓' : p.error }}</td>
               </tr>
             </tbody>
           </table>
+          <p v-if="data.caveat" class="caveat">{{ data.caveat }}</p>
         </div>
       </section>
     </template>
@@ -262,6 +269,7 @@ onMounted(async () => {
 .title { display: flex; align-items: center; gap: .5rem; margin: 0; font-size: 1.45rem; color: var(--bq-text); }
 .lead { margin: .4rem 0 0; color: var(--bq-muted); font-size: .9rem; }
 .panel { margin-bottom: 1rem; padding: 1rem; border-radius: .9rem; background: var(--bq-bg-elevated); border: 1px solid rgba(255,255,255,.06); }
+.caveat { margin: .75rem 0 0; font-size: .78rem; line-height: 1.6; color: var(--bq-muted); }
 .controls-top { display: flex; flex-wrap: wrap; gap: .6rem; align-items: end; }
 .fld { display: grid; gap: .25rem; font-size: .78rem; color: var(--bq-muted); }
 .fld input, .fld select { border: 1px solid rgba(255,255,255,.14); border-radius: .5rem; padding: .45rem .5rem; background: rgba(8,12,21,.7); color: var(--bq-text); }

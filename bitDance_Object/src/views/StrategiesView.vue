@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
 import MarkdownBody from '../components/bitdance/MarkdownBody.vue'
+import RiskPanel from '../components/bitdance/RiskPanel.vue'
 import { Play, Share2 } from 'lucide-vue-next'
 import { listStrategies, runBacktest, type BacktestParams, type BacktestResult, type StrategyListItem } from '../services/backtest'
 import { formatStrategyOptionLabel } from '../data/strategyDisplayNames'
@@ -91,7 +92,7 @@ const metrics = computed(() => {
   if (!stats) {
     return []
   }
-  return [
+  const base = [
     { label: '总收益率', value: formatPercent(stats.total_return), hint: '策略区间累计收益' },
     { label: '年化收益', value: formatPercent(stats.annual_return), hint: '折算到年维度的收益率' },
     { label: '夏普比率', value: formatNumber(stats.sharpe_ratio, 3), hint: '单位风险对应超额收益' },
@@ -100,6 +101,17 @@ const metrics = computed(() => {
     { label: '期末权益', value: formatMoney(stats.end_balance), hint: '回测结束账户权益' },
     { label: '净利润', value: formatMoney(stats.total_net_pnl), hint: '总收益扣除成本后结果' },
   ]
+
+  // 风险闸门结论置顶展示，避免只看收益忽略风险
+  const gate = result.value?.risk_gate
+  if (gate) {
+    base.unshift({
+      label: gate.approved ? '风控闸门' : '风控否决',
+      value: gate.approved ? '通过' : '未通过',
+      hint: gate.approved ? '仓位/回撤/VaR/波动硬规则均满足' : gate.reasons.join('；') || '见下方风险面板',
+    })
+  }
+  return base
 })
 
 const performanceChartOption = computed<EChartsOption>(() => {
@@ -680,6 +692,13 @@ function formatTradeAction(action: string | undefined, fallbackSide: string) {
       <div class="chart-wrap">
         <VChart ref="ddChartRef" class="chart chart-sub" :option="drawdownChartOption" autoresize />
       </div>
+
+      <RiskPanel
+        v-if="result?.risk_metrics"
+        :risk-metrics="result.risk_metrics"
+        :monthly-returns="result.monthly_returns"
+        :risk-gate="result.risk_gate"
+      />
     </section>
 
     <section v-if="result?.trade_rounds?.length" class="card trades-card">

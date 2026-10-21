@@ -9,6 +9,7 @@ export interface CompareCell {
   trade_count?: number
   stats?: Record<string, number | string | null>
   series?: { dates: string[]; returns: number[] }
+  risk_metrics?: RiskBlock
 }
 
 export interface ComparePayload {
@@ -19,6 +20,17 @@ export interface ComparePayload {
   dates: string[]
   curves: Record<string, (number | null)[]>
   results: CompareCell[]
+  risk_summary?: Record<
+    string,
+    {
+      class_name?: string
+      sharpe?: number | null
+      sortino?: number | null
+      max_drawdown_pct?: number | null
+      var_95_pct?: number | null
+      risk_gate?: 'APPROVE' | 'REJECT' | null
+    }
+  >
   message: string
 }
 
@@ -55,6 +67,12 @@ export interface GridCell {
   annual_return?: number | null
   max_drawdown?: number | null
   sharpe?: number | null
+  sortino?: number | null
+  calmar?: number | null
+  var_95_pct?: number | null
+  cvar_95_pct?: number | null
+  gate_ok?: boolean
+  gate_reasons?: string[]
   trade_count?: number
 }
 
@@ -69,6 +87,9 @@ export interface GridPayload {
   end: string
   cells: GridCell[]
   best?: GridCell | null
+  objective?: 'sharpe' | 'total_return'
+  risk_gate_applied?: boolean
+  risk_gate_rejected?: number
   message: string
   cached?: boolean
   mode?: '1d' | '2d'
@@ -83,7 +104,73 @@ export interface Grid2DBest {
   total_return?: number
   max_drawdown?: number
   sharpe?: number
+  sortino?: number
+  calmar?: number
+  var_95_pct?: number
   trade_count?: number
+}
+
+/** 风险与绩效指标（risk_metrics 模块输出，日频口径） */
+export interface RiskMetrics {
+  samples: number
+  active_days?: number
+  active_ratio?: number
+  total_return_pct: number
+  annual_return_pct: number
+  annual_volatility_pct: number
+  sharpe_ratio: number
+  sortino_ratio: number
+  calmar_ratio: number
+  max_drawdown_pct: number
+  max_drawdown_duration_days: number
+  ulcer_index_pct: number
+  var_95_pct: number
+  cvar_95_pct: number
+  daily_win_rate: number
+  profit_factor_daily: number | null
+  skew: number
+  excess_kurtosis: number
+  risk_free_rate: number
+  periods_per_year: number
+  max_position_pct?: number
+  avg_position_pct?: number
+  exposure_days_ratio?: number
+  degenerate?: boolean
+  degenerate_reason?: string | null
+}
+
+export interface RiskGateCheck {
+  rule: string
+  value: unknown
+  threshold: unknown
+  passed: boolean
+  desc: string
+}
+
+export interface RiskGate {
+  approved: boolean
+  verdict: 'APPROVE' | 'REJECT'
+  reasons: string[]
+  checks: RiskGateCheck[]
+  limits: Record<string, number>
+}
+
+export interface MonthlyReturn {
+  month: string
+  return_pct: number
+}
+
+export interface RiskBlock {
+  risk_metrics: RiskMetrics
+  monthly_returns: MonthlyReturn[]
+  risk_gate: RiskGate
+  exposure?: {
+    max_position_pct: number
+    avg_position_pct: number
+    exposure_days_ratio: number
+    days: number
+  }
+  notes?: string[]
 }
 
 export interface RealtimeQuote {
@@ -97,12 +184,31 @@ export interface PortfolioSymbolResult {
   class_name?: string
   total_return?: number
   trade_count?: number
-}export interface PortfolioPayload {
+  /** 名义金额模式下：区间期初价（换算股数用） */
+  first_close?: number | null
+  /** 名义金额模式下：换算出的股数 */
+  fixed_size?: number | null
+  /** 名义金额模式下：实际目标名义金额 = 期初价 × 股数 */
+  target_notional?: number | null
+}
+
+export interface PortfolioWeight {
+  vt_symbol: string
+  weight: number
+  /** 名义金额模式下：目标名义金额（元） */
+  target_notional?: number
+  /** 名义金额模式下：换算出的股数 */
+  fixed_size?: number | null
+  /** 名义金额模式下：区间期初价（用于换算股数） */
+  first_close?: number | null
+}
+
+export interface PortfolioPayload {
   success: boolean
   strategy_id: string
   class_name?: string | null
   vt_symbols: string[]
-  weights: { vt_symbol: string; weight: number }[]
+  weights: PortfolioWeight[]
   start: string
   end: string
   dates: string[]
@@ -110,11 +216,20 @@ export interface PortfolioSymbolResult {
   stats?: {
     total_return?: number
     annual_return?: number
+    annual_volatility_pct?: number
     max_drawdown?: number
     sharpe_ratio?: number
+    sortino_ratio?: number
+    calmar_ratio?: number
+    var_95_pct?: number
     total_trade_count?: number
   }
+  risk_metrics?: RiskMetrics
+  monthly_returns?: MonthlyReturn[]
   per_symbol: PortfolioSymbolResult[]
+  /** notional = 按名义金额分配（推荐）；fixed_shares = 固定股数（历史行为） */
+  size_mode?: 'notional' | 'fixed_shares'
+  caveat?: string
   message: string
 }
 
@@ -235,6 +350,8 @@ export function runGrid(body: {
   start?: string
   end?: string
   capital?: number
+  objective?: 'sharpe' | 'total_return'
+  apply_risk_gate?: boolean
 }): Promise<GridPayload> {
   return post('/analytics/grid', body)
 }
@@ -247,6 +364,11 @@ export function runPortfolio(body: {
   end?: string
   capital?: number
   fixed_params?: Record<string, number>
+  /**
+   * 每个标的的目标名义金额（元）。组合等权必须用名义金额而非固定股数——
+   * 一篮子标的价格从 7 元到 2300 元，固定股数会让实际权重严重偏离设定权重。
+   */
+  notional_per_symbol?: number[]
 }): Promise<PortfolioPayload> {
   return post('/analytics/portfolio', body)
 }

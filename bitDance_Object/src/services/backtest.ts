@@ -1,5 +1,6 @@
-export interface BacktestParams {
-  strategyId: string
+import type { MonthlyReturn, RiskGate, RiskMetrics } from './analytics'
+
+export interface BacktestParams {  strategyId: string
   vtSymbol: string
   start: string
   end: string
@@ -120,6 +121,17 @@ export interface BacktestResult {
   signal_quality?: SignalQuality
   daily_position_exposure?: DailyPositionExposure[]
   data_scope?: DataScope
+  /** 风险与绩效深化（risk_metrics）：下行风险、尾部风险、月度分布、风控闸门 */
+  risk_metrics?: RiskMetrics
+  monthly_returns?: MonthlyReturn[]
+  risk_gate?: RiskGate
+  exposure?: {
+    max_position_pct: number
+    avg_position_pct: number
+    exposure_days_ratio: number
+    days: number
+  }
+  notes?: string[]
 }
 
 export interface StrategyListItem {
