@@ -50,7 +50,8 @@ jobs:
 
       - name: 编译检查
         run: |
-          python -m py_compile trader/main.py trader/routers/*.py trader/examples/cta_backtesting/run_rewritten_strategy_backtest.py
+          python -m py_compile trader/main.py trader/routers/*.py
+          python -m py_compile trader/examples/cta_backtesting/*.py
           python -m py_compile trader/examples/cta_backtesting/rewritten_strategies/family_*.py
 
       - name: 回测引擎测试

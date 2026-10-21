@@ -27,6 +27,14 @@ from examples.cta_backtesting.run_rewritten_strategy_backtest import (
     load_strategy_class,
     main as _run_backtest_main,
 )
+from examples.cta_backtesting.risk_metrics import (
+    RiskLimits,
+    compute_risk_metrics,
+    cumulative_to_returns,
+    evaluate_risk_gate,
+    monthly_returns,
+    position_exposure_summary,
+)
 from routers.free_market import fetch_daily as free_daily
 from routers.free_market import fetch_stock_list as free_list
 from routers.market_data import ts_code_to_vt_symbol
@@ -101,10 +109,15 @@ def _run_backtest(sid: str, cfg: dict) -> dict:
     stats = engine.calculate_statistics()
 
     series = {"dates": [], "balance": []}
+    first_close = None
     if result_df is not None and not result_df.empty:
         series["dates"] = [i.strftime("%Y-%m-%d") if hasattr(i, "strftime") else str(i) for i in result_df.index]
         if "balance" in result_df.columns:
             series["balance"] = [float(v) for v in result_df["balance"].fillna(0).tolist()]
+        if "close_price" in result_df.columns:
+            series["close"] = [float(v) for v in result_df["close_price"].fillna(0).tolist()]
+            if series["close"]:
+                first_close = series["close"][0]
 
     # 归一化为百分比收益，便于多策略叠加对比
     norm = []
@@ -120,7 +133,35 @@ def _run_backtest(sid: str, cfg: dict) -> dict:
         "stats": {k: _safe(v) for k, v in stats.items()},
         "trade_count": len(engine.trades),
         "series": {"dates": series["dates"], "returns": norm},
+        "first_close": first_close,
+        "risk_metrics": _risk_block(series["dates"], norm, engine.daily_df, float(cfg.get("size", 1))),
     }
+
+
+def _risk_block(dates: list, returns: list, daily_df: Any, size: float) -> dict:
+    """由权益曲线 + 逐日盯市表计算风险指标、月度收益与风控闸门结论。
+
+    失败时返回空 dict，不影响主回测结果返回。
+    """
+    if not dates or not returns:
+        return {}
+    try:
+        rets = cumulative_to_returns(returns)
+        metrics = compute_risk_metrics(rets)
+        exposure = position_exposure_summary(daily_df, size)
+        metrics["max_position_pct"] = exposure["max_position_pct"]
+        metrics["avg_position_pct"] = exposure["avg_position_pct"]
+        metrics["exposure_days_ratio"] = exposure["exposure_days_ratio"]
+        return {
+            "risk_metrics": metrics,
+            # nav_to_returns 由 n 个净值产生 n-1 个收益，日期需同步去掉首日
+            "monthly_returns": monthly_returns(dates[1:], rets),
+            "risk_gate": evaluate_risk_gate(metrics, max_position_pct=exposure["max_position_pct"]),
+            "exposure": exposure,
+        }
+    except Exception as e:  # 风控计算失败不应让回测结果消失
+        logger.warning("风险指标计算失败: %r", e)
+        return {}
 
 
 # ---- 多策略对比 ----
@@ -165,6 +206,19 @@ def compare_strategies(body: CompareRequest):
                 arr[date_index[d]] = v
         aligned[r["strategy_id"]] = arr
 
+    # 风险指标汇总（供前端按夏普/回撤排序，而非只看收益）
+    risk_summary = {
+        r["strategy_id"]: {
+            "class_name": r.get("class_name"),
+            "sharpe": (r.get("risk_metrics") or {}).get("risk_metrics", {}).get("sharpe_ratio"),
+            "sortino": (r.get("risk_metrics") or {}).get("risk_metrics", {}).get("sortino_ratio"),
+            "max_drawdown_pct": (r.get("risk_metrics") or {}).get("risk_metrics", {}).get("max_drawdown_pct"),
+            "var_95_pct": (r.get("risk_metrics") or {}).get("risk_metrics", {}).get("var_95_pct"),
+            "risk_gate": (r.get("risk_metrics") or {}).get("risk_gate", {}).get("verdict"),
+        }
+        for r in ok_results
+    }
+
     return {
         "success": len(ok_results) > 0,
         "vt_symbol": body.vt_symbol,
@@ -173,6 +227,7 @@ def compare_strategies(body: CompareRequest):
         "dates": all_dates,
         "curves": aligned,
         "results": results,
+        "risk_summary": risk_summary,
         "message": f"成功 {len(ok_results)}/{len(ids)} 个策略" if ok_results else "全部策略回测失败，请确认已同步行情数据",
     }
 
@@ -385,14 +440,28 @@ class GridRequest(BaseModel):
     start: str = "2024-01-01"
     end: str | None = None
     capital: int = 10_000
+    objective: str = Field(
+        "sharpe",
+        description="寻优目标：sharpe（风险调整后）/ total_return（纯收益，仅用于对比过拟合风险）",
+    )
+    apply_risk_gate: bool = Field(True, description="是否用确定性风控闸门过滤不合格参数组合")
 
 
 @router.post("/grid")
 def grid_optimize(body: GridRequest):
-    """参数网格扫描：单参数或多参数（双因子热力图）。"""
+    """参数网格扫描：单参数或多参数（双因子热力图）。
+
+    寻优口径：
+      - objective=sharpe（默认）：按风险调整后收益排序，**降低过拟合风险**
+      - objective=total_return：按纯收益排序，仅用于观察参数曲面是否只有孤立尖峰
+      - apply_risk_gate=True：先用确定性硬规则过滤不合格组合，剩余中再择优
+    """
     values = [float(v) for v in body.values][:16]
     if len(values) < 2:
         raise HTTPException(status_code=400, detail="至少提供 2 个参数取值")
+
+    if body.objective not in ("sharpe", "total_return"):
+        raise HTTPException(status_code=400, detail="objective 仅支持 sharpe / total_return")
 
     sid = str(body.strategy_id).zfill(2)
     end = body.end or date.today().isoformat()
@@ -409,7 +478,8 @@ def grid_optimize(body: GridRequest):
             raise HTTPException(status_code=400, detail=f"网格组合数 {cells_total} 超过上限 {MAX_GRID_CELLS}")
 
     cache_key = json.dumps(
-        {"sid": sid, "p1": body.param_name, "v1": values, "p2": param2, "v2": values2, "c": cfg_base},
+        {"sid": sid, "p1": body.param_name, "v1": values, "p2": param2, "v2": values2, "c": cfg_base,
+         "obj": body.objective, "gate": body.apply_risk_gate},
         sort_keys=True,
     )
     cached = _grid_cache.get(cache_key)
@@ -424,6 +494,15 @@ def grid_optimize(body: GridRequest):
         if p2 is not None:
             cfg[param2] = (int(p2) if p2.is_integer() else p2)
         return pool.submit(_run_backtest, sid, cfg), p1, p2
+
+    def _score(cell: dict) -> float | None:
+        """按寻优目标取排序分。"""
+        if not cell.get("ok"):
+            return None
+        if body.objective == "sharpe":
+            s = cell.get("sharpe")
+            return float(s) if isinstance(s, (int, float)) else None
+        return cell.get("total_return")
 
     if is_2d:
         # 双因子：以 (v1, v2) 为键收集，方便组矩阵
@@ -441,12 +520,20 @@ def grid_optimize(body: GridRequest):
             if r.get("ok"):
                 best_class = r.get("class_name") or best_class
                 st = r.get("stats", {})
+                rm = r.get("risk_metrics") or {}
+                gate = (r.get("risk_metrics") or {}).get("risk_gate") or {}
+                gate_ok = (not body.apply_risk_gate) or bool(gate.get("approved", True))
                 tr = st.get("total_return")
                 results_by_cell[(v1, v2)] = {
                     "ok": True,
+                    "gate_ok": gate_ok,
+                    "gate_reasons": gate.get("reasons", []),
                     "total_return": round(float(tr), 3) if isinstance(tr, (int, float)) else None,
                     "max_drawdown": round(float(st.get("max_drawdown", 0) or 0), 3) if isinstance(st.get("max_drawdown"), (int, float)) else None,
                     "sharpe": _safe(st.get("sharpe_ratio")),
+                    "sortino": rm.get("risk_metrics", {}).get("sortino_ratio") if rm else None,
+                    "calmar": rm.get("risk_metrics", {}).get("calmar_ratio") if rm else None,
+                    "var_95_pct": rm.get("risk_metrics", {}).get("var_95_pct") if rm else None,
                     "trade_count": r.get("trade_count", 0),
                 }
             else:
@@ -455,15 +542,23 @@ def grid_optimize(body: GridRequest):
         # 热力图矩阵
         matrix = []
         best = None
+        rejected = 0
         for v1 in values:
             row = []
             for v2 in values2:
                 cell = results_by_cell.get((v1, v2), {"ok": False, "error": "?"})
                 row.append(cell.get("total_return") if cell.get("ok") else None)
-                if cell.get("ok") and cell.get("total_return") is not None:
-                    if best is None or cell["total_return"] > best["total_return"]:
-                        best = {"p1": v1, "p2": v2, "total_return": cell["total_return"], **{k: cell[k] for k in ("max_drawdown", "sharpe", "trade_count")}}
+                if cell.get("ok") and not cell.get("gate_ok", True):
+                    rejected += 1
+                elif cell.get("ok") and cell.get("total_return") is not None:
+                    score = _score(cell)
+                    if score is not None and (best is None or score > best["_score"]):
+                        best = {"p1": v1, "p2": v2, "total_return": cell["total_return"], "_score": score,
+                                **{k: cell[k] for k in ("max_drawdown", "sharpe", "sortino", "calmar", "var_95_pct", "trade_count")}}
             matrix.append(row)
+
+        if best is not None:
+            best.pop("_score", None)
 
         data = {
             "success": best is not None,
@@ -475,12 +570,20 @@ def grid_optimize(body: GridRequest):
             "values2": values2,
             "matrix": matrix,
             "best": best,
+            "objective": body.objective,
+            "risk_gate_applied": body.apply_risk_gate,
+            "risk_gate_rejected": rejected,
             "vt_symbol": body.vt_symbol,
             "start": body.start,
             "end": end,
             "cells": len(results_by_cell),
             "mode": "2d",
-            "message": f"扫描 {len(values)}×{len(values2)} 组参数" + (f"，最佳 {body.param_name}={best['p1']} & {param2}={best['p2']}（总收益 {best['total_return']}%）" if best else "（无有效结果）"),
+            "message": (
+                f"扫描 {len(values)}×{len(values2)} 组参数"
+                + (f"，按 {body.objective} 择优：{body.param_name}={best['p1']} & {param2}={best['p2']}"
+                   f"（收益 {best['total_return']}%，夏普 {best.get('sharpe')}）" if best else "（无有效结果）")
+                + (f"，风控闸门过滤 {rejected} 组" if body.apply_risk_gate and rejected else "")
+            ),
         }
         _grid_cache[cache_key] = {"ts": time.time(), "data": data}
         return data
@@ -494,6 +597,8 @@ def grid_optimize(body: GridRequest):
 
     cells = []
     best_class = None
+    best = None
+    rejected = 0
     for fut, v in futures.items():
         try:
             r = fut.result(timeout=300)
@@ -504,25 +609,38 @@ def grid_optimize(body: GridRequest):
             best_class = r.get("class_name")
             total_return = st.get("total_return")
             dd = st.get("max_drawdown")
-            cells.append({
+            rm = (r.get("risk_metrics") or {}).get("risk_metrics") or {}
+            gate = (r.get("risk_metrics") or {}).get("risk_gate") or {}
+            gate_ok = (not body.apply_risk_gate) or bool(gate.get("approved", True))
+            if not gate_ok:
+                rejected += 1
+            cell = {
                 "value": v,
                 "ok": True,
+                "gate_ok": gate_ok,
+                "gate_reasons": gate.get("reasons", []),
                 "total_return": round(float(total_return), 3) if isinstance(total_return, (int, float)) else None,
                 "annual_return": _safe(st.get("annual_return")),
                 "max_drawdown": round(float(dd), 3) if isinstance(dd, (int, float)) else None,
                 "sharpe": _safe(st.get("sharpe_ratio")),
+                "sortino": rm.get("sortino_ratio"),
+                "calmar": rm.get("calmar_ratio"),
+                "var_95_pct": rm.get("var_95_pct"),
+                "cvar_95_pct": rm.get("cvar_95_pct"),
                 "trade_count": r.get("trade_count", 0),
-            })
+            }
+            cells.append(cell)
+            score = _score(cell)
+            if score is not None and cell["gate_ok"] and (best is None or score > best["_score"]):
+                best = {**cell, "_score": score}
         else:
             cells.append({"value": v, "ok": False, "error": r.get("error", "回测失败")})
 
-    best = None
-    ok_cells = [c for c in cells if c["ok"] and c.get("total_return") is not None]
-    if ok_cells:
-        best = max(ok_cells, key=lambda c: c["total_return"])
+    if best is not None:
+        best.pop("_score", None)
 
     data = {
-        "success": len(ok_cells) > 0,
+        "success": any(c["ok"] for c in cells),
         "strategy_id": sid,
         "class_name": best_class,
         "param_name": body.param_name,
@@ -531,8 +649,16 @@ def grid_optimize(body: GridRequest):
         "end": end,
         "cells": sorted(cells, key=lambda c: c["value"]),
         "best": best,
+        "objective": body.objective,
+        "risk_gate_applied": body.apply_risk_gate,
+        "risk_gate_rejected": rejected,
         "mode": "1d",
-        "message": f"扫描 {len(cells)} 组参数" + (f"，最佳 {body.param_name}={best['value']}（总收益 {best['total_return']}%）" if best else "（无有效结果）"),
+        "message": (
+            f"扫描 {len(cells)} 组参数"
+            + (f"，按 {body.objective} 择优 {body.param_name}={best['value']}"
+               f"（收益 {best['total_return']}%，夏普 {best.get('sharpe')}）" if best else "（无通过风控的有效结果）")
+            + (f"，风控闸门过滤 {rejected} 组" if body.apply_risk_gate and rejected else "")
+        ),
     }
     _grid_cache[cache_key] = {"ts": time.time(), "data": data}
     return data
@@ -628,11 +754,92 @@ class PortfolioRequest(BaseModel):
     pricetick: float = 0.01
     size: float = 1
     fixed_params: dict[str, float] | None = None
+    notional_per_symbol: list[float] | None = Field(
+        None,
+        description=(
+            "每个标的的目标名义金额（元），长度需与 vt_symbols 一致。"
+            "不传时退化为 fixed_params.fixed_size 的股数模式。"
+            "组合等权必须用名义金额而非股数——一篮子标的价格从 7 元到 2300 元，"
+            "固定股数会让实际权重严重偏离设定权重。"
+        ),
+    )
 
 
 @router.post("/portfolio")
+def _fetch_first_close(cfg: dict) -> float | None:
+    """只取某标的在回测区间内的第一根日线收盘价，用于名义金额换算股数。
+
+    不走完整回测：直接读本地库的第一根 bar，比跑一次回测便宜两个数量级。
+    """
+    from vnpy.trader.constant import Interval
+    from vnpy.trader.database import get_database
+    from examples.cta_backtesting.run_rewritten_strategy_backtest import parse_date
+
+    try:
+        vt = cfg["vt_symbol"]
+        db = get_database()
+        ov = [b for b in db.get_bar_overview() if f"{b.symbol}.{b.exchange.value}" == vt]
+        if not ov:
+            return None
+        b = ov[0]
+        bars = db.load_bar_data(
+            b.symbol,
+            b.exchange,
+            Interval.DAILY,
+            parse_date(cfg["start"]),
+            parse_date(cfg["end"]),
+        )
+        if not bars:
+            return None
+        px = float(bars[0].close_price)
+        return px if px > 0 else None
+    except Exception as e:
+        logger.warning("first_close 获取失败 %s: %s", cfg.get("vt_symbol"), e)
+        return None
+
+
+def shares_for_notional(
+    symbols: list[str], notionals: list[float], prices: list[float | None]
+) -> dict[str, float]:
+    """按目标名义金额与期初价换算股数；价格或金额无效的标的直接跳过。
+
+    为什么不用固定股数：一篮子标的价格可能相差数百倍，同样的股数会让实际
+    名义金额（进而权重）严重偏离设定值。
+    """
+    out: dict[str, float] = {}
+    for sym, target, px in zip(symbols, notionals, prices):
+        if not px or px <= 0:
+            continue
+        t = float(target)
+        if t <= 0:
+            continue
+        out[sym] = max(1.0, round(t / px))
+    return out
+
+
+def combine_sleeve_returns(
+    date_rets: dict[str, dict[str, float]],
+    weights: dict[str, float],
+    use_sum: bool,
+) -> tuple[list[str], list[float]]:
+    """合成各标的 sleeve 日收益为组合日收益。
+
+    use_sum=True（名义金额模式）：资金分配已体现在各 sleeve 仓位里，直接求和。
+    再乘一次权重会让权重被平方。
+    use_sum=False（固定股数模式，历史行为）：按权重加权求和。
+    """
+    all_dates = sorted({d for srets in date_rets.values() for d in srets})
+    out: list[float] = []
+    for d in all_dates:
+        if use_sum:
+            out.append(sum(srets.get(d, 0.0) for srets in date_rets.values()))
+        else:
+            out.append(sum(float(weights.get(s, 0.0)) * srets.get(d, 0.0) for s, srets in date_rets.items()))
+    return all_dates, out
+
+
 def portfolio_backtest(body: PortfolioRequest):
-    """组合回测：同一策略在多标的上分别出信号，等权/自定义权重分配资金。
+    """组合回测：同一策略在多标的上分别出信号，按目标名义金额分配仓位。
 
     说明：项目策略族基于 vn.py CtaTemplate，这里做组合回测采用「信号照搬」方案——
     每个标的独立运行该策略，用目标仓位驱动组合引擎，得到组合净值/回撤。
@@ -642,13 +849,18 @@ def portfolio_backtest(body: PortfolioRequest):
     symbols = [str(s) for s in body.vt_symbols if str(s).strip()]
     if len(symbols) < 2:
         raise HTTPException(status_code=400, detail="组合至少需要 2 个标的")
-    symbols = symbols[:10]
+    if len(symbols) > 10:
+        symbols = symbols[:10]  # 上限 10 个，超过的部分截断而非报错
 
-    weights = body.weights
+    # weights / notional_per_symbol 都必须与截断后的 symbols 对齐
+    weights = body.weights[:len(symbols)] if body.weights else None
+    notional = body.notional_per_symbol[:len(symbols)] if body.notional_per_symbol else None
+    if weights is not None and len(weights) != len(symbols):
+        raise HTTPException(status_code=400, detail="weights 长度必须与 vt_symbols 一致")
+    if notional is not None and len(notional) != len(symbols):
+        raise HTTPException(status_code=400, detail="notional_per_symbol 长度必须与 vt_symbols 一致")
     if weights is None:
         weights = [1.0 / len(symbols)] * len(symbols)
-    if len(weights) != len(symbols):
-        raise HTTPException(status_code=400, detail="weights 长度必须与 vt_symbols 一致")
     total_w = sum(float(w) for w in weights)
     if total_w <= 0:
         raise HTTPException(status_code=400, detail="权重之和必须为正")
@@ -680,7 +892,27 @@ def portfolio_backtest(body: PortfolioRequest):
     if body.fixed_params:
         cfg_base.update(body.fixed_params)
 
-    futures = {pool.submit(_run_backtest, sid, {**cfg_base, "vt_symbol": s}): s for s in symbols}
+    if notional is not None and len(notional) != len(symbols):
+        raise HTTPException(status_code=400, detail="notional_per_symbol 长度必须与 vt_symbols 一致")
+
+    # 名义金额模式：先取各标的期初价换算股数（只读第一根 bar，不跑回测）
+    prices: list[float | None] = []
+    fixed_size_by_symbol: dict[str, float] = {}
+    first_close_by_symbol: dict[str, float] = {}
+    if notional is not None:
+        for sym in symbols:
+            prices.append(_fetch_first_close({**cfg_base, "vt_symbol": sym}))
+        fixed_size_by_symbol = shares_for_notional(symbols, notional, prices)
+        first_close_by_symbol = {
+            sym: px for sym, px in zip(symbols, prices) if px and px > 0 and sym in fixed_size_by_symbol
+        }
+
+    futures = {}
+    for sym in symbols:
+        cfg = {**cfg_base, "vt_symbol": sym}
+        if sym in fixed_size_by_symbol:
+            cfg["fixed_size"] = fixed_size_by_symbol[sym]
+        futures[pool.submit(_run_backtest, sid, cfg)] = sym
 
     # 收集每个标的的日收益序列，按日期对齐后加权合成组合净值
     date_rets: dict[str, dict[str, float]] = {}
@@ -712,6 +944,8 @@ def portfolio_backtest(body: PortfolioRequest):
                 srets[d] = (cum / 100.0 + 1.0) / (prev / 100.0 + 1.0) - 1.0
             prev = cum
         date_rets[s] = srets
+        _px = r.get("first_close") or first_close_by_symbol.get(s)
+        _fs = fixed_size_by_symbol.get(s)
         per_symbol.append(
             {
                 "vt_symbol": s,
@@ -719,6 +953,9 @@ def portfolio_backtest(body: PortfolioRequest):
                 "class_name": r.get("class_name"),
                 "total_return": round(float(r["stats"].get("total_return", 0) or 0), 3),
                 "trade_count": r.get("trade_count", 0),
+                "first_close": _px,
+                "fixed_size": _fs,
+                "target_notional": (round(_px * _fs, 2) if (_px and _fs) else None),
             }
         )
 
@@ -727,42 +964,55 @@ def portfolio_backtest(body: PortfolioRequest):
             "success": False,
             "strategy_id": sid,
             "message": "组合中所有标的回测失败，请确认已同步行情数据",
-            "per_symbol": per_symbol,
+        "per_symbol": per_symbol,
+        "dropped_symbols": dropped,
         }
 
-    all_dates = sorted({d for srets in date_rets.values() for d in srets})
-    comb_ret: dict[str, float] = {}
-    for d in all_dates:
-        acc = 0.0
-        for s, srets in date_rets.items():
-            idx = symbols.index(s)
-            acc += float(weights[idx]) * srets.get(d, 0.0)
-        comb_ret[d] = acc
+    use_sum = notional is not None
+    all_dates, comb_list = combine_sleeve_returns(
+        date_rets,
+        {s: float(weights[symbols.index(s)]) for s in date_rets},
+        use_sum=use_sum,
+    )
+    comb_ret = dict(zip(all_dates, comb_list))
+
+    # 组合绩效统一走 risk_metrics 口径（与单策略回测一致，便于横向比较）
+    port_returns = comb_list
+    metrics = compute_risk_metrics(port_returns)
 
     nav = 1.0
     navs: list[float] = []
-    for d in all_dates:
-        nav *= 1.0 + comb_ret.get(d, 0.0)
+    for r in port_returns:
+        nav *= 1.0 + r
         navs.append(round(nav, 6))
 
-    peak = 1.0
-    max_dd = 0.0
-    for n in navs:
-        peak = max(peak, n)
-        dd = n / peak - 1.0
-        max_dd = min(max_dd, dd)
-
-    returns = comb_ret
-    avg = sum(returns.values()) / len(returns) if returns else 0.0
-    std = (sum((r - avg) ** 2 for r in returns.values()) / max(1, len(returns) - 1)) ** 0.5
-    sharpe = (avg / std * 252 ** 0.5) if std > 0 else 0.0
     total_ret = navs[-1] - 1.0 if navs else 0.0
 
-    # 各标的权重展示
-    weight_info = [
-        {"vt_symbol": s, "weight": round(float(w), 4)}
-        for s, w in zip(symbols, weights)
-    ]
+    # 各标的权重展示：只统计真正进入组合的 sleeve（回测失败的标的不计入分母，
+    # 否则权重之和为 1 但实际少了一腿，组合收益会被高估）。
+    dropped = [s for s in symbols if s not in date_rets]
+    active = [s for s in symbols if s in date_rets]
+    if use_sum:
+        _notionals = [
+            (first_close_by_symbol[s] * fixed_size_by_symbol[s]) if s in fixed_size_by_symbol else 0.0
+            for s in active
+        ]
+        _sum_n = sum(_notionals) or 1.0
+        weight_info = [
+            {
+                "vt_symbol": s,
+                "weight": round(n / _sum_n, 4),
+                "target_notional": round(n, 2) if n > 0 else None,
+                "fixed_size": fixed_size_by_symbol.get(s),
+                "first_close": first_close_by_symbol.get(s),
+            }
+            for s, n in zip(active, _notionals)
+        ]
+    else:
+        weight_info = [
+            {"vt_symbol": s, "weight": round(float(weights[symbols.index(s)]), 4)}
+            for s in active
+        ]
 
     return {
         "success": True,
@@ -775,13 +1025,29 @@ def portfolio_backtest(body: PortfolioRequest):
         "dates": all_dates,
         "nav": navs,
         "stats": {
-            "total_return": round(total_ret * 100, 3),
-            "annual_return": round(((1 + total_ret) ** (252 / max(1, len(all_dates))) - 1) * 100, 3),
-            "max_drawdown": round(max_dd * 100, 3),
-            "sharpe_ratio": round(float(sharpe), 3),
+            "total_return": metrics["total_return_pct"],
+            "annual_return": metrics["annual_return_pct"],
+            "annual_volatility_pct": metrics["annual_volatility_pct"],
+            "max_drawdown": round(-metrics["max_drawdown_pct"], 3),
+            "sharpe_ratio": metrics["sharpe_ratio"],
+            "sortino_ratio": metrics["sortino_ratio"],
+            "calmar_ratio": metrics["calmar_ratio"],
+            "var_95_pct": metrics["var_95_pct"],
             "total_trade_count": sum(p.get("trade_count", 0) for p in per_symbol if p.get("ok")),
         },
+        "risk_metrics": metrics,
+        "monthly_returns": monthly_returns(all_dates, port_returns),
         "per_symbol": per_symbol,
+        "caveat": (
+            "「信号照搬」式组合回测：每个标的独立运行同一策略，按各自目标名义金额定仓后"
+            "合成日收益。未建模标的间相关性、共享资金池、再平衡成本与同时开仓的资金占用，"
+            "不等于真实组合绩效。" if use_sum else
+            "「信号照搬」式组合回测：每个标的独立分得一份资金后等权/加权合成，"
+            "未建模标的间相关性、共享资金池、再平衡成本与同时开仓的资金占用，"
+            "不等于真实组合绩效。注意固定股数模式下不同标的名义金额不一致，"
+            "实际权重会偏离 weights；建议改用 notional_per_symbol 按名义金额分配。"
+        ),
+        "size_mode": "notional" if use_sum else "fixed_shares",
         "message": f"组合回测完成：{len(date_rets)}/{len(symbols)} 个标的有数据，加权净值 {round(total_ret * 100, 2)}%",
     }
 

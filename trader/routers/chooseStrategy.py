@@ -6,6 +6,14 @@ import logging
 from fastapi import APIRouter, HTTPException
 import numpy as np
 
+from examples.cta_backtesting.risk_metrics import (
+    RiskLimits,
+    compute_risk_metrics,
+    cumulative_to_returns,
+    evaluate_risk_gate,
+    monthly_returns,
+    position_exposure_summary,
+)
 from examples.cta_backtesting.run_rewritten_strategy_backtest import DEFAULT_CONFIG, main
 from examples.cta_backtesting.trade_analytics import build_trade_extensions
 
@@ -146,6 +154,32 @@ def get_strategy(
 
     trade_extensions = build_trade_extensions(trades, result_df, config)
 
+    # ---- 风险与绩效深化（risk_metrics） ----
+    # 用「区间累计收益%」反推日收益序列，再算下行风险/尾部风险/月度分布/风控闸门。
+    risk_block: dict = {}
+    if has_series:
+        base = series["balance"][0] if series["balance"][0] else None
+        if base:
+            cum_pct = [(b / base - 1.0) * 100.0 for b in series["balance"]]
+            rets = cumulative_to_returns(cum_pct)
+            metrics = compute_risk_metrics(rets)
+            exposure = position_exposure_summary(result_df, float(config.get("size", 1)))
+            metrics["max_position_pct"] = exposure["max_position_pct"]
+            metrics["avg_position_pct"] = exposure["avg_position_pct"]
+            metrics["exposure_days_ratio"] = exposure["exposure_days_ratio"]
+            risk_block = {
+                "risk_metrics": metrics,
+                # nav_to_returns 由 n 个净值产生 n-1 个收益，日期需同步去掉首日
+                "monthly_returns": monthly_returns(series["dates"][1:], rets),
+                "risk_gate": evaluate_risk_gate(metrics, max_position_pct=exposure["max_position_pct"]),
+                "exposure": exposure,
+                "notes": [
+                    "日收益由权益曲线反推，与 vn.py 逐日 net_pnl 口径可能存在微小差异",
+                    "VaR/CVaR 为历史模拟法（日频，95%），非参数分布假设",
+                    "风控闸门为确定性硬规则判定，不含主观市场判断",
+                ],
+            }
+
     return {
         "success": has_series and trade_count > 0,
         "message": message,
@@ -154,5 +188,6 @@ def get_strategy(
         "series": series,
         "trade_points": trade_points,
         **trade_extensions,
+        **risk_block,
     }
 
