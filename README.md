@@ -10,11 +10,12 @@
 
 - **策略研究**：将聚宽社区 99 份策略模板去重改写为 **23 个 vn.py `CtaTemplate` 策略族**（均线 / MACD / RSRS / 布林 / 海龟 / 机器学习等），配套族参数映射与公共指标库
 - **真实回测**：基于 vn.py `BacktestingEngine` 的日线回测，输出收益曲线、回撤、夏普、胜率、交易明细等完整指标
+- **风险与风控**：独立风险模块（纯函数）补齐下行风险与尾部风险——索提诺 / Calmar / 溃疡指数 / 历史模拟法 VaR / CVaR / 偏度峰度 / 月度收益分布，配套**确定性风控闸门**（仓位 / 回撤 / VaR / 波动硬阈值逐条判定 + 一票否决）；参数寻优默认按夏普排序
 - **多维分析**：多策略对比、因子选股、参数网格优化（单参数 + 双因子热力图）、组合回测、纸面交易、市场热力图
 - **免费行情**：腾讯公开接口（免 token）提供全市场列表、日线、分钟线与实时快照，支持 TuShare 切换
 - **智能辅助**：Kimi 驱动的回测报告生成、报告对比、AI 问答
 - **社区生态**：帖子 / 点赞 / 评论，策略回测结果可一键分享
-- **工程化**：GitHub Actions CI（后端 / 回测 / 前端三 job）、pytest 测试、一键启动脚本
+- **工程化**：GitHub Actions CI（后端 / 回测 / 前端三 job）、pytest 测试（62 用例，含 26 个风险模块单测）、一键启动脚本
 
 ### 技术栈
 
@@ -46,8 +47,10 @@ bitDance/
 │  │  └─ chat.py                          # Kimi 智能助手（Moonshot API）
 │  ├─ examples/cta_backtesting/           # ★ 策略改写与回测模块
 │  │  ├─ rewritten_strategies/            # 23 个族策略 + manifest.csv + 工具函数
+│  │  ├─ risk_metrics.py                  # ★ 风险/绩效指标库 + 确定性风控闸门（纯函数）
+│  │  ├─ trade_analytics.py               # 逐笔成交/FIFO回合/信号质量/日度敞口
 │  │  └─ run_rewritten_strategy_backtest.py
-│  └─ tests/                              # 回测引擎 + 分析功能 pytest（21 个用例）
+│  └─ tests/                              # 回测引擎 + 风险指标 + 分析功能 pytest
 └─ bitDance_Object/
    ├─ package.json                        # 前端依赖与脚本
    ├─ vite.config.ts                      # 代理：/strategy /chat /api/market→8000，/api→8080
@@ -98,8 +101,32 @@ bitDance/
   - `rewritten_strategies/_family_helpers.py`：族策略公共指标库（zscore/RSRS/KDJ/GFTD/ATR 等）
   - `rewritten_strategies/manifest.csv`：99 份模板 → 族策略类 + 默认参数的映射
   - `rewritten_strategies/_archived_v1/`：早期一次性生成的 100 份近似重复策略（已归档）
+  - `risk_metrics.py`：风险与绩效指标库（见下节）
+  - `trade_analytics.py`：逐笔成交、FIFO 回合、信号质量、日度敞口
   - `run_rewritten_strategy_backtest.py`：按 manifest 加载族策略并回测的引擎入口
 - 策略来源：聚宽社区 99 份策略模板（`.txt`），改写清单见 `rewritten_strategies/manifest.csv`
+
+### 4) 风险与绩效指标（`risk_metrics.py`）
+
+vn.py 的 `calculate_statistics()` 只给出夏普和最大回撤，本模块补齐风险视角：
+
+| 类别 | 指标 | 口径 |
+|------|------|------|
+| 收益 | 累计 / 年化收益 | 几何年化，年化 252 |
+| 波动 | 年化波动率、年化下行波动率 | 日收益标准差 × √252 |
+| 风险调整 | 夏普、索提诺、Calmar | 索提诺分母仅用下行波动 |
+| 回撤 | 最大回撤、回撤持续天数、溃疡指数 | 溃疡指数 = √mean(回撤²) |
+| 尾部 | VaR(95%)、CVaR(95%) | 历史模拟法，不假设正态分布 |
+| 分布 | 偏度、超额峰度、日胜率、盈亏因子 | 识别"高夏普但负偏度"陷阱 |
+| 仓位 | 最大 / 平均仓位占比、持仓天数占比 | 逐日 `end_pos × close × size / balance` |
+
+配套**确定性风控闸门** `evaluate_risk_gate()`：仓位 / 回撤 / VaR / 年化波动 / 样本量逐条布尔判定，
+任一不过即 `REJECT`（一票否决），拒绝原因逐条返回便于审计。
+
+> **退化序列保护**：若样本期内几乎没有成交（如 400 天仅 1 笔），权益曲线几乎全平，
+> 日收益只剩浮点噪声（~1e-10），直接计算会得到夏普 -1291 万这类无意义数值。
+> 模块通过「日波动下限 + 有效交易天数占比」双重判定标记 `degenerate`、将比率归零，
+> 并拒绝其通过风控闸门——避免"没交易"被误判成"零风险、安全"。
 
 > **注意**：原始 33 份"向导式"模板是同一套聚宽向导框架的参数化副本，改写时已归并为
 > `FamilyWizard` 一个族；其余 66 份按所选策略逻辑（均线/MACD/RSRS/布林/海龟/机器学习等）
@@ -231,7 +258,7 @@ python trader/main.py
 | Job | 内容 |
 |-----|------|
 | `python-backend` | 编译检查 + 后端 8080 接口冒烟测试（4 用例） |
-| `python-trader` | 编译检查 + 回测引擎测试（7 用例） |
+| `python-trader` | 编译检查 + 回测引擎 + 风险指标测试（62 用例，含 26 个风险模块单测 + 11 个组合合成单测） |
 | `frontend` | `vue-tsc --noEmit` 类型检查 + `npm run build` |
 
 本地运行测试：
@@ -247,6 +274,24 @@ python -m pytest trader/tests -q
 ```
 
 > 后端测试通过 `BITDANCE_DB_PATH` 环境变量使用临时数据库；生产/开发默认使用 `bitDance_Object/backend/data/app.db`。
+
+## 复现组合业绩
+
+`scripts/collect_portfolio_metrics.py` 可独立运行：库中缺少标的或数据覆盖不足时，会自动从腾讯公开源分段拉取真实前复权日线并写入本地库（幂等，已满足则跳过）。
+
+```bash
+# 1) 体检本地行情，可选：修复坏数据 / 全量重拉
+python scripts/repair_market_data.py --dry-run
+python scripts/repair_market_data.py --all
+
+# 2) 8 标的等权组合回测 + 每日再平衡基准（缺数据会自动同步）
+python scripts/collect_portfolio_metrics.py
+
+# 3) 离线模式：只用本地已有数据，不访问网络
+python scripts/collect_portfolio_metrics.py --no-sync
+```
+
+脚本会为每个标的打印 `SYNCED`（本次拉取）或 `CACHED`（本地已满足），并输出每个标的的目标名义金额、换算股数与期初价，便于核对权重是否真等权。
 
 
 ## 免责声明
