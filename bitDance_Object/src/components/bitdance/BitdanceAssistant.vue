@@ -8,7 +8,7 @@ import { getToken } from '../../services/auth'
 import { useAuth } from '../../state/auth'
 import { authSessionEpoch } from '../../state/authSession'
 import { getLastBacktestResult } from '../../state/bitdanceBacktestContext'
-import { appendBacktestReport } from '../../state/backtestReportHistory'
+import { appendBacktestReport, pushReportToServer } from '../../state/backtestReportHistory'
 
 const router = useRouter()
 const route = useRoute()
@@ -177,7 +177,9 @@ async function send(message: string, options?: { showThinking?: boolean; reportU
               params: (lastResult.params ?? {}) as Record<string, unknown>,
             }
           : undefined
-      appendBacktestReport(auth.user.value.id, replyText, meta)
+      const entry = appendBacktestReport(auth.user.value.id, replyText, meta)
+      // 同步到服务端（失败不影响本地保存）
+      void pushReportToServer(auth.user.value.id, entry)
     }
   } catch (error) {
     const text = error instanceof Error ? error.message : '调用服务失败'

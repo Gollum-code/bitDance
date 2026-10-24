@@ -170,7 +170,174 @@ export interface RiskBlock {
     exposure_days_ratio: number
     days: number
   }
+  /** Block bootstrap 置信区间（monte_carlo 模块输出） */
+  monte_carlo?: MonteCarloResult
   notes?: string[]
+}
+
+/** 单个指标的 bootstrap 分布摘要 */
+export interface MonteCarloStat {
+  p05: number
+  p50: number
+  p95: number
+  mean: number
+  std: number
+  prob_positive: number
+}
+
+export interface MonteCarloResult {
+  ok: boolean
+  reason?: string
+  sims?: number
+  block?: number
+  confidence?: number
+  sample?: {
+    total_return_pct: number
+    annual_return_pct: number
+    sharpe: number
+    max_drawdown_pct: number
+  }
+  /** 各指标分布（百分比口径） */
+  total_return?: MonteCarloStat
+  annual_return?: MonteCarloStat
+  /** 风险类指标：回撤深度是绝对值，越大越糟 */
+  max_drawdown?: MonteCarloStat
+  sharpe?: MonteCarloStat
+  sharpe_ci?: [number, number]
+  drawdown_p95?: number
+  /** 逐日累计收益置信带（%），用于扇形图 */
+  band?: { lo: number[]; mid: number[]; hi: number[] }
+  interpretation?: string[]
+}
+
+/** 前向验证（walk-forward）单折结果 */
+export interface WalkForwardFold {
+  fold: number
+  train_start: string
+  train_end: string
+  test_start: string
+  test_end: string
+  ok: boolean
+  reason?: string
+  best_params?: Record<string, number>
+  in_sample_score?: number
+  in_sample_return?: number | null
+  in_sample_sharpe?: number | null
+  oos_params?: Record<string, number>
+  oos_score?: number | null
+  oos_return?: number | null
+  oos_sharpe?: number | null
+  oos_max_drawdown?: number | null
+  oos_trade_count?: number
+  /** 样本内到样本外的退化幅度 */
+  degradation?: number | null
+  candidates?: number
+}
+
+export interface WalkForwardPayload {
+  ok: boolean
+  reason?: string
+  strategy_id: string
+  class_name?: string | null
+  param_name: string
+  values: number[]
+  vt_symbol: string
+  start: string
+  end: string
+  objective: string
+  n_splits: number
+  train_ratio: number
+  embargo_days: number
+  apply_risk_gate: boolean
+  folds: WalkForwardFold[]
+  in_sample_avg: number
+  oos_avg: number
+  oos_returns_pct: number[]
+  /** 样本外 / 样本内 表现比，<0.5 视为明显过拟合 */
+  efficiency_ratio: number
+  consistency: number
+  overfit_probability: number
+  verdict: string
+  message: string
+}
+
+/** 参数稳定性 / 过拟合检测 */
+export interface StabilityPayload {
+  ok: boolean
+  reason?: string
+  strategy_id: string
+  class_name?: string | null
+  param_name: string
+  objective: string
+  best_param?: number
+  best_score?: number
+  neighbor_avg?: number
+  degradation?: number
+  smoothness?: number
+  /** True = 孤立尖峰，过拟合风险高 */
+  isolated_peak?: boolean
+  threshold?: number
+  points?: number
+  curve?: { param: number; score: number }[]
+  verdict?: string
+  vt_symbol: string
+  start: string
+  end: string
+}
+
+/** 因子有效性（IC / IR） */
+export interface FactorIcPayload {
+  success: boolean
+  factor: string
+  horizon: number
+  lookback_days: number
+  symbols: string[]
+  periods: number
+  ic: {
+    periods: number
+    ic_mean: number | null
+    ic_std: number | null
+    ic_ir: number | null
+    t_stat: number | null
+    positive_ratio: number | null
+    latest_ic: number | null
+    quantile_spread_avg_pct?: number | null
+    verdict: string
+    verdict_label: string
+  }
+  ic_series: number[]
+  quantile?: {
+    ok: boolean
+    reason?: string
+    quantiles?: number
+    group_returns_pct?: number[]
+    long_short_spread_pct?: number
+    monotonicity?: number
+    direction?: string
+  }
+  message: string
+}
+
+/** 异步回测任务 */
+export interface JobInfo {
+  job_id: string
+  kind: string
+  status: 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
+  progress: number
+  stage: string
+  created_at: number
+  finished_at: number | null
+  elapsed_ms: number
+  error: string | null
+  result?: unknown
+  success?: boolean
+}
+
+export interface JobStats {
+  total: number
+  running: number
+  pending: number
+  workers: number
 }
 
 export interface RealtimeQuote {
@@ -441,4 +608,183 @@ export function openRealtimeWs(symbols: string[], onMessage: (items: RealtimeQuo
 
 export interface DailyBarEx extends DailyBar {
   __name?: string
+}
+
+// ---------------- 前向验证 / 稳定性 / 因子 IC / 异步任务 ----------------
+
+export function runWalkForward(body: {
+  strategy_id: string
+  param_name: string
+  values: number[]
+  vt_symbol?: string
+  start?: string
+  end?: string
+  capital?: number
+  n_splits?: number
+  train_ratio?: number
+  embargo_days?: number
+  objective?: 'sharpe' | 'total_return' | 'calmar'
+  fixed_params?: Record<string, number>
+  apply_risk_gate?: boolean
+}): Promise<WalkForwardPayload> {
+  return post('/analytics/walk-forward', body)
+}
+
+export function runStability(body: {
+  strategy_id: string
+  param_name: string
+  values: number[]
+  objective?: 'sharpe' | 'total_return' | 'calmar'
+  vt_symbol?: string
+  start?: string
+  end?: string
+  capital?: number
+  neighbor_ratio?: number
+  fixed_params?: Record<string, number>
+}): Promise<StabilityPayload> {
+  return post('/analytics/stability', body)
+}
+
+export async function runFactorIc(body: {
+  vt_symbols: string[]
+  factor?: string
+  horizon?: number
+  lookback_days?: number
+  end_date?: string
+}): Promise<FactorIcPayload> {
+  return post('/analytics/factor-ic', body)
+}
+
+export async function getFactorUniverse(limit = 20): Promise<{ symbols: string[]; count: number }> {
+  const r = await fetch(`/analytics/factor-universe?limit=${limit}`)
+  if (!r.ok) throw new Error(await readError(r))
+  return r.json()
+}
+
+/** 提交异步回测任务（不阻塞 HTTP 连接） */
+async function submitJob<T>(path: string, body: unknown): Promise<T> {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) throw new Error(await readError(r))
+  return r.json() as Promise<T>
+}
+
+export function submitCompareJob(body: {
+  strategy_ids: string[]
+  vt_symbol: string
+  start: string
+  end?: string
+}): Promise<{ job_id: string; kind: string; status: string }> {
+  return submitJob('/analytics/jobs/compare', body)
+}
+
+export function submitGridJob(body: {
+  strategy_id: string
+  param_name: string
+  values: number[]
+  param2?: string
+  values2?: number[]
+  fixed_params?: Record<string, number>
+  vt_symbol?: string
+  start?: string
+  end?: string
+  capital?: number
+  objective?: 'sharpe' | 'total_return'
+  apply_risk_gate?: boolean
+}): Promise<{ job_id: string; kind: string; status: string }> {
+  return submitJob('/analytics/jobs/grid', body)
+}
+
+export function submitPortfolioJob(body: {
+  strategy_id: string
+  vt_symbols: string[]
+  weights?: number[]
+  start?: string
+  end?: string
+  capital?: number
+  fixed_params?: Record<string, number>
+  notional_per_symbol?: number[]
+}): Promise<{ job_id: string; kind: string; status: string }> {
+  return submitJob('/analytics/jobs/portfolio', body)
+}
+
+export function submitWalkForwardJob(body: {
+  strategy_id: string
+  param_name: string
+  values: number[]
+  vt_symbol?: string
+  start?: string
+  end?: string
+  capital?: number
+  n_splits?: number
+  train_ratio?: number
+  embargo_days?: number
+  objective?: 'sharpe' | 'total_return' | 'calmar'
+  fixed_params?: Record<string, number>
+  apply_risk_gate?: boolean
+}): Promise<{ job_id: string; kind: string; status: string }> {
+  return submitJob('/analytics/jobs/walk-forward', body)
+}
+
+export async function getJob(jobId: string): Promise<JobInfo> {
+  const r = await fetch(`/analytics/jobs/${encodeURIComponent(jobId)}`)
+  if (!r.ok) throw new Error(await readError(r))
+  return r.json() as Promise<JobInfo>
+}
+
+export async function cancelJob(jobId: string): Promise<{ job_id: string; status: string }> {
+  const r = await fetch(`/analytics/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
+  if (!r.ok) throw new Error(await readError(r))
+  return r.json() as Promise<{ job_id: string; status: string }>
+}
+
+/**
+ * 轮询异步任务直到终态。
+ * onUpdate 每次状态变化回调（用于进度条），onDone 拿到最终结果。
+ * 返回取消函数——调用后停止轮询。
+ */
+export function pollJob(
+  jobId: string,
+  handlers: {
+    onUpdate?: (info: JobInfo) => void
+    onDone?: (info: JobInfo) => void
+    onError?: (err: Error) => void
+  },
+  intervalMs = 1200,
+): () => void {
+  let stopped = false
+  let timer: number | undefined
+
+  const tick = async () => {
+    if (stopped) return
+    try {
+      const info = await getJob(jobId)
+      handlers.onUpdate?.(info)
+      if (info.status === 'done') {
+        stopped = true
+        handlers.onDone?.(info)
+        return
+      }
+      if (info.status === 'failed' || info.status === 'cancelled') {
+        stopped = true
+        handlers.onError?.(new Error(info.error || `任务${info.status === 'failed' ? '失败' : '已取消'}`))
+        return
+      }
+    } catch (e) {
+      handlers.onError?.(e instanceof Error ? e : new Error(String(e)))
+      return
+    }
+    if (!stopped) {
+      timer = window.setTimeout(tick, intervalMs)
+    }
+  }
+
+  void tick()
+  return () => {
+    stopped = true
+    if (timer !== undefined) window.clearTimeout(timer)
+  }
 }

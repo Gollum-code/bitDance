@@ -35,6 +35,9 @@ const form = ref({
   atrWindow: 6,
   atrMult: 1.2,
   fixedSize: 1000,
+  stopLossPct: 0,
+  takeProfitPct: 0,
+  trailingStopPct: 0,
 })
 const loading = ref(false)
 const loadingStrategies = ref(false)
@@ -658,6 +661,9 @@ function formatTradeAction(action: string | undefined, fallbackSide: string) {
         <label>ATR窗口 atrWindow<input v-model.number="form.atrWindow" type="number" step="1" min="1" /></label>
         <label>ATR倍数 atrMult<input v-model.number="form.atrMult" type="number" step="0.1" min="0" /></label>
         <label>每次下单手数 fixedSize<input v-model.number="form.fixedSize" type="number" step="1" min="1" /></label>
+        <label>固定止损 %<input v-model.number="form.stopLossPct" type="number" step="0.5" min="0" title="0 = 关闭；如 5 表示回撤 5% 平仓" /></label>
+        <label>固定止盈 %<input v-model.number="form.takeProfitPct" type="number" step="0.5" min="0" title="0 = 关闭" /></label>
+        <label>移动止损 %<input v-model.number="form.trailingStopPct" type="number" step="0.5" min="0" title="从持仓最高点回撤该比例平仓；0 = 关闭" /></label>
       </div>
       <div class="run-actions">
         <button type="button" class="run-btn" :disabled="loading" @click="handleRunBacktest">
@@ -698,6 +704,7 @@ function formatTradeAction(action: string | undefined, fallbackSide: string) {
         :risk-metrics="result.risk_metrics"
         :monthly-returns="result.monthly_returns"
         :risk-gate="result.risk_gate"
+        :monte-carlo="result.monte_carlo"
       />
     </section>
 

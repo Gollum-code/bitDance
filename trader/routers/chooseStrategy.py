@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 import numpy as np
 
+from examples.cta_backtesting.monte_carlo import monte_carlo_summary
 from examples.cta_backtesting.risk_metrics import (
     RiskLimits,
     compute_risk_metrics,
@@ -62,6 +63,9 @@ def get_strategy(
     atr_window: int | None = None,
     atr_mult: float | None = None,
     fixed_size: int | None = None,
+    stop_loss_pct: float | None = None,
+    take_profit_pct: float | None = None,
+    trailing_stop_pct: float | None = None,
 ):
     from datetime import date as _date
 
@@ -84,6 +88,9 @@ def get_strategy(
     config["atr_window"] = atr_window
     config["atr_mult"] = atr_mult
     config["fixed_size"] = fixed_size
+    config["stop_loss_pct"] = stop_loss_pct
+    config["take_profit_pct"] = take_profit_pct
+    config["trailing_stop_pct"] = trailing_stop_pct
 
     try:
         stats, result_df, trades = main(config)
@@ -167,18 +174,21 @@ def get_strategy(
             metrics["max_position_pct"] = exposure["max_position_pct"]
             metrics["avg_position_pct"] = exposure["avg_position_pct"]
             metrics["exposure_days_ratio"] = exposure["exposure_days_ratio"]
-            risk_block = {
-                "risk_metrics": metrics,
-                # nav_to_returns 由 n 个净值产生 n-1 个收益，日期需同步去掉首日
-                "monthly_returns": monthly_returns(series["dates"][1:], rets),
-                "risk_gate": evaluate_risk_gate(metrics, max_position_pct=exposure["max_position_pct"]),
-                "exposure": exposure,
-                "notes": [
-                    "日收益由权益曲线反推，与 vn.py 逐日 net_pnl 口径可能存在微小差异",
-                    "VaR/CVaR 为历史模拟法（日频，95%），非参数分布假设",
-                    "风控闸门为确定性硬规则判定，不含主观市场判断",
-                ],
-            }
+        risk_block = {
+            "risk_metrics": metrics,
+            # nav_to_returns 由 n 个净值产生 n-1 个收益，日期需同步去掉首日
+            "monthly_returns": monthly_returns(series["dates"][1:], rets),
+            "risk_gate": evaluate_risk_gate(metrics, max_position_pct=exposure["max_position_pct"]),
+            "exposure": exposure,
+            # Block bootstrap 置信区间：回答「夏普/回撤是运气还是实力」
+            "monte_carlo": monte_carlo_summary(rets, sims=1000, block=20, seed=42),
+            "notes": [
+                "日收益由权益曲线反推，与 vn.py 逐日 net_pnl 口径可能存在微小差异",
+                "VaR/CVaR 为历史模拟法（日频，95%），非参数分布假设",
+                "风控闸门为确定性硬规则判定，不含主观市场判断",
+                "Monte Carlo 为 block bootstrap（块长 20 日，保留序列相关），同参数结果可复现",
+            ],
+        }
 
     return {
         "success": has_series and trade_count > 0,

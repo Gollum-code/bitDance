@@ -1,8 +1,18 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { Wallet, Play, Loader2, TrendingUp, TrendingDown, Minus } from 'lucide-vue-next'
+import { Wallet, Play, Loader2, TrendingUp, TrendingDown, Minus, BookmarkPlus, XCircle, Trash2 } from 'lucide-vue-next'
 import { listStrategies, type StrategyListItem } from '../services/backtest'
 import { runPaper, type PaperPayload } from '../services/analytics'
+import { useAuth } from '../state/auth'
+import {
+  closePaperPosition,
+  createPaperPosition,
+  deletePaperPosition,
+  listPaperPositions,
+  type PaperPosition,
+} from '../services/workspace'
+
+const auth = useAuth()
 
 const strategies = ref<StrategyListItem[]>([])
 const sid = ref('01')
@@ -13,6 +23,84 @@ const capital = ref(50000)
 const loading = ref(false)
 const err = ref('')
 const data = ref<PaperPayload | null>(null)
+
+// ---- 服务端持仓账本 ----
+const positions = ref<PaperPosition[]>([])
+const posBusy = ref(false)
+const posErr = ref('')
+const posMsg = ref('')
+
+async function loadPositions() {
+  if (!auth.user.value) return
+  try {
+    const res = await listPaperPositions()
+    positions.value = res.items
+    posErr.value = ''
+  } catch (e) {
+    posErr.value = e instanceof Error ? e.message : '持仓加载失败'
+  }
+}
+
+async function saveCurrentPosition() {
+  const d = data.value
+  if (!d?.success || d.position_code === 0 || !d.entry_price || !d.entry_date) {
+    posErr.value = '当前没有可保存的持仓（空仓或无进场信息）'
+    return
+  }
+  posBusy.value = true
+  posErr.value = ''
+  posMsg.value = ''
+  try {
+    await createPaperPosition({
+      strategyId: d.strategy_id,
+      vtSymbol: d.vt_symbol,
+      side: d.position_code > 0 ? 'long' : 'short',
+      entryPrice: d.entry_price,
+      entryDate: d.entry_date,
+      capital: d.capital,
+      note: `${d.class_name ?? ''} 纸面交易快照`,
+    })
+    posMsg.value = '已保存到服务端账本'
+    await loadPositions()
+  } catch (e) {
+    posErr.value = e instanceof Error ? e.message : '保存失败'
+  } finally {
+    posBusy.value = false
+  }
+}
+
+async function closePosition(p: PaperPosition) {
+  const price = data.value?.vt_symbol === p.vtSymbol && data.value.latest_price > 0
+    ? data.value.latest_price
+    : p.entryPrice
+  if (!confirm(`以 ${price.toFixed(2)} 平仓 ${p.vtSymbol}？`)) return
+  posBusy.value = true
+  try {
+    await closePaperPosition(p.id, { exitPrice: price })
+    await loadPositions()
+  } catch (e) {
+    posErr.value = e instanceof Error ? e.message : '平仓失败'
+  } finally {
+    posBusy.value = false
+  }
+}
+
+async function removePosition(p: PaperPosition) {
+  if (!confirm('删除这条持仓记录？')) return
+  posBusy.value = true
+  try {
+    await deletePaperPosition(p.id)
+    await loadPositions()
+  } catch (e) {
+    posErr.value = e instanceof Error ? e.message : '删除失败'
+  } finally {
+    posBusy.value = false
+  }
+}
+
+function fmtMoney(v: number) {
+  return v.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+}
 
 async function run() {
   if (!vtSymbol.value.trim()) {
@@ -73,6 +161,8 @@ onMounted(async () => {
   } catch (e) {
     err.value = e instanceof Error ? e.message : '策略清单加载失败'
   }
+  await auth.init()
+  await loadPositions()
 })
 </script>
 
@@ -150,6 +240,56 @@ onMounted(async () => {
           </div>
         </div>
         <p class="hint">基于真实策略回测成交推导：持仓 = 最后一笔未平仓交易。策略参数：{{ Object.entries(data.params_used ?? {}).map(([k, v]) => `${k}=${v}`).join(' · ') || '默认' }}</p>
+        <div v-if="auth.user.value" class="save-row">
+          <button class="btn ghost" :disabled="posBusy" @click="saveCurrentPosition">
+            <BookmarkPlus class="ic" /> 保存当前持仓到账本
+          </button>
+          <span v-if="posMsg" class="ok-inline">{{ posMsg }}</span>
+          <span v-if="posErr" class="err-inline">{{ posErr }}</span>
+        </div>
+      </section>
+
+      <section v-if="auth.user.value" class="panel">
+        <h2 class="h2">我的纸面持仓账本（{{ positions.length }}）</h2>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th class="left">标的</th>
+                <th class="left">策略</th>
+                <th>方向</th>
+                <th>进场</th>
+                <th>出场</th>
+                <th>收益率</th>
+                <th>状态</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="p in positions" :key="p.id">
+                <td class="left mono">{{ p.vtSymbol }}</td>
+                <td class="left">{{ p.strategyId }}</td>
+                <td>{{ p.side === 'long' ? '多' : '空' }}</td>
+                <td>{{ p.entryDate }} @ {{ p.entryPrice.toFixed(2) }}</td>
+                <td>{{ p.exitDate ? `${p.exitDate} @ ${p.exitPrice?.toFixed(2)}` : '—' }}</td>
+                <td :class="roundClass(p.returnPct ?? 0)">
+                  {{ p.returnPct == null ? '—' : `${p.returnPct > 0 ? '+' : ''}${p.returnPct.toFixed(2)}%` }}
+                </td>
+                <td>{{ p.status === 'open' ? '持仓中' : '已平仓' }}</td>
+                <td class="actions-cell">
+                  <button v-if="p.status === 'open'" class="mini" :disabled="posBusy" @click="closePosition(p)">平仓</button>
+                  <button class="mini danger" :disabled="posBusy" @click="removePosition(p)">
+                    <Trash2 class="ic-xs" />
+                  </button>
+                </td>
+              </tr>
+              <tr v-if="!positions.length">
+                <td colspan="8" class="muted-cell">暂无记录。运行纸面交易后点「保存当前持仓到账本」。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="hint">账本保存在服务端，换设备/刷新后仍在。</p>
       </section>
 
       <section class="panel">
@@ -260,3 +400,11 @@ onMounted(async () => {
   .tbl { font-size: .74rem; }
 }
 </style>
+.save-row { display: flex; flex-wrap: wrap; align-items: center; gap: .7rem; margin-top: .8rem; padding-top: .8rem; border-top: 1px dashed rgba(255,255,255,.08); }
+.btn.ghost { background: rgba(255,255,255,.06); color: var(--bq-text); }
+.ok-inline { color: #4ade80; font-size: .78rem; }
+.err-inline { color: #f87171; font-size: .78rem; }
+.actions-cell { display: flex; gap: .35rem; justify-content: flex-end; }
+.mini { border: 0; border-radius: .4rem; padding: .28rem .5rem; font-size: .72rem; cursor: pointer; background: rgba(90,169,255,.16); color: #bcd6f7; }
+.mini.danger { background: rgba(248,113,113,.16); color: #fca5a5; display: inline-flex; align-items: center; }
+.mini:disabled { opacity: .5; cursor: not-allowed; }

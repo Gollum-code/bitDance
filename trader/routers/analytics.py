@@ -27,6 +27,7 @@ from examples.cta_backtesting.run_rewritten_strategy_backtest import (
     load_strategy_class,
     main as _run_backtest_main,
 )
+from examples.cta_backtesting.monte_carlo import monte_carlo_summary
 from examples.cta_backtesting.risk_metrics import (
     RiskLimits,
     compute_risk_metrics,
@@ -37,6 +38,7 @@ from examples.cta_backtesting.risk_metrics import (
 )
 from routers.free_market import fetch_daily as free_daily
 from routers.free_market import fetch_stock_list as free_list
+from routers.job_store import JobCancelled, JobManager
 from routers.market_data import ts_code_to_vt_symbol
 
 router = APIRouter()
@@ -46,6 +48,7 @@ MAX_COMPARE = 8
 MAX_GRID_CELLS = 60
 _grid_cache: dict[str, Any] = {}
 _executor_pool: ThreadPoolExecutor | None = None
+jobs = JobManager()
 
 
 def _executor() -> ThreadPoolExecutor:
@@ -66,7 +69,7 @@ def _safe(v: Any) -> Any:
     return v
 
 
-def _run_backtest(sid: str, cfg: dict) -> dict:
+def _run_backtest(sid: str, cfg: dict, include_monte_carlo: bool = True) -> dict:
     """执行单策略回测，返回 stats + series(权益曲线) + 交易数。不抛异常，失败用 ok=False。"""
     import sys as _sys
 
@@ -97,7 +100,7 @@ def _run_backtest(sid: str, cfg: dict) -> dict:
         pricetick=cfg.get("pricetick", DEFAULT_CONFIG["pricetick"]),
         capital=cfg.get("capital", DEFAULT_CONFIG["capital"]),
     )
-    overrides = {k: cfg.get(k) for k in ("fast_window", "slow_window", "signal_window", "atr_window", "atr_mult", "fixed_size")}
+    overrides = {k: cfg.get(k) for k in getattr(strategy_cls, "parameters", []) if cfg.get(k) is not None}
     setting = build_setting(strategy_cls, row, overrides)
     engine.add_strategy(strategy_cls, setting)
     engine.load_data()
@@ -134,11 +137,14 @@ def _run_backtest(sid: str, cfg: dict) -> dict:
         "trade_count": len(engine.trades),
         "series": {"dates": series["dates"], "returns": norm},
         "first_close": first_close,
-        "risk_metrics": _risk_block(series["dates"], norm, engine.daily_df, float(cfg.get("size", 1))),
+        "risk_metrics": _risk_block(
+            series["dates"], norm, engine.daily_df, float(cfg.get("size", 1)),
+            include_monte_carlo=include_monte_carlo,
+        ),
     }
 
 
-def _risk_block(dates: list, returns: list, daily_df: Any, size: float) -> dict:
+def _risk_block(dates: list, returns: list, daily_df: Any, size: float, *, include_monte_carlo: bool = True) -> dict:
     """由权益曲线 + 逐日盯市表计算风险指标、月度收益与风控闸门结论。
 
     失败时返回空 dict，不影响主回测结果返回。
@@ -152,13 +158,17 @@ def _risk_block(dates: list, returns: list, daily_df: Any, size: float) -> dict:
         metrics["max_position_pct"] = exposure["max_position_pct"]
         metrics["avg_position_pct"] = exposure["avg_position_pct"]
         metrics["exposure_days_ratio"] = exposure["exposure_days_ratio"]
-        return {
+        out: dict[str, Any] = {
             "risk_metrics": metrics,
             # nav_to_returns 由 n 个净值产生 n-1 个收益，日期需同步去掉首日
             "monthly_returns": monthly_returns(dates[1:], rets),
             "risk_gate": evaluate_risk_gate(metrics, max_position_pct=exposure["max_position_pct"]),
             "exposure": exposure,
         }
+        if include_monte_carlo:
+            # 多策略对比场景用较少模拟次数（每条曲线都要算，控制响应时间）
+            out["monte_carlo"] = monte_carlo_summary(rets, sims=400, block=20, seed=42)
+        return out
     except Exception as e:  # 风控计算失败不应让回测结果消失
         logger.warning("风险指标计算失败: %r", e)
         return {}
@@ -176,6 +186,10 @@ class CompareRequest(BaseModel):
 
 @router.post("/compare")
 def compare_strategies(body: CompareRequest):
+    return _compare_impl(body)
+
+
+def _compare_impl(body: CompareRequest, progress=None, cancelled=None):
     """同一标的、同一区间跑多个策略，输出收益曲线 + 统计对比。"""
     ids = [str(s).zfill(2) for s in body.strategy_ids][:MAX_COMPARE]
     if not ids:
@@ -187,11 +201,15 @@ def compare_strategies(body: CompareRequest):
     futures = {pool.submit(_run_backtest, sid, cfg_base): sid for sid in ids}
     results = []
     for fut in futures:
+        if cancelled is not None and cancelled():
+            raise JobCancelled()
         try:
             results.append(fut.result(timeout=300))
         except Exception as e:
             logger.exception("对比回测失败")
             results.append({"ok": False, "error": str(e)})
+        if progress is not None:
+            progress(1, "backtest")
 
     ok_results = [r for r in results if r.get("ok")]
     # 统一日期轴（取最长序列，其余按日期对齐）
@@ -449,6 +467,10 @@ class GridRequest(BaseModel):
 
 @router.post("/grid")
 def grid_optimize(body: GridRequest):
+    return _grid_impl(body)
+
+
+def _grid_impl(body: GridRequest, progress=None, cancelled=None):
     """参数网格扫描：单参数或多参数（双因子热力图）。
 
     寻优口径：
@@ -493,7 +515,7 @@ def grid_optimize(body: GridRequest):
         cfg[body.param_name] = (int(p1) if p1.is_integer() else p1)
         if p2 is not None:
             cfg[param2] = (int(p2) if p2.is_integer() else p2)
-        return pool.submit(_run_backtest, sid, cfg), p1, p2
+        return pool.submit(_run_backtest, sid, cfg, False), p1, p2
 
     def _score(cell: dict) -> float | None:
         """按寻优目标取排序分。"""
@@ -513,10 +535,14 @@ def grid_optimize(body: GridRequest):
         results_by_cell: dict[tuple[float, float], dict] = {}
         best_class = None
         for fut, v1, v2 in futures:
+            if cancelled is not None and cancelled():
+                raise JobCancelled()
             try:
                 r = fut.result(timeout=300)
             except Exception as e:
                 r = {"ok": False, "error": str(e)}
+            if progress is not None:
+                progress(1, f"{body.param_name}={v1} {param2}={v2}")
             if r.get("ok"):
                 best_class = r.get("class_name") or best_class
                 st = r.get("stats", {})
@@ -593,17 +619,21 @@ def grid_optimize(body: GridRequest):
     for v in values:
         cfg = dict(cfg_base)
         cfg[body.param_name] = (int(v) if v.is_integer() else v)
-        futures[pool.submit(_run_backtest, sid, cfg)] = v
+        futures[pool.submit(_run_backtest, sid, cfg, False)] = v
 
     cells = []
     best_class = None
     best = None
     rejected = 0
     for fut, v in futures.items():
+        if cancelled is not None and cancelled():
+            raise JobCancelled()
         try:
             r = fut.result(timeout=300)
         except Exception as e:
             r = {"ok": False, "error": str(e)}
+        if progress is not None:
+            progress(1, f"{body.param_name}={v}")
         if r.get("ok"):
             st = r.get("stats", {})
             best_class = r.get("class_name")
@@ -765,7 +795,6 @@ class PortfolioRequest(BaseModel):
     )
 
 
-@router.post("/portfolio")
 def _fetch_first_close(cfg: dict) -> float | None:
     """只取某标的在回测区间内的第一根日线收盘价，用于名义金额换算股数。
 
@@ -838,7 +867,12 @@ def combine_sleeve_returns(
     return all_dates, out
 
 
+@router.post("/portfolio")
 def portfolio_backtest(body: PortfolioRequest):
+    return _portfolio_impl(body)
+
+
+def _portfolio_impl(body: PortfolioRequest, progress=None, cancelled=None):
     """组合回测：同一策略在多标的上分别出信号，按目标名义金额分配仓位。
 
     说明：项目策略族基于 vn.py CtaTemplate，这里做组合回测采用「信号照搬」方案——
@@ -912,17 +946,21 @@ def portfolio_backtest(body: PortfolioRequest):
         cfg = {**cfg_base, "vt_symbol": sym}
         if sym in fixed_size_by_symbol:
             cfg["fixed_size"] = fixed_size_by_symbol[sym]
-        futures[pool.submit(_run_backtest, sid, cfg)] = sym
+        futures[pool.submit(_run_backtest, sid, cfg, False)] = sym
 
     # 收集每个标的的日收益序列，按日期对齐后加权合成组合净值
     date_rets: dict[str, dict[str, float]] = {}
     symbol_class = None
     per_symbol = []
     for fut, s in futures.items():
+        if cancelled is not None and cancelled():
+            raise JobCancelled()
         try:
             r = fut.result(timeout=300)
         except Exception as e:
             r = {"ok": False, "error": str(e)}
+        if progress is not None:
+            progress(1, f"sleeve {s}")
         if not r.get("ok"):
             per_symbol.append({"vt_symbol": s, "ok": False, "error": r.get("error", "回测失败")})
             continue
@@ -960,12 +998,13 @@ def portfolio_backtest(body: PortfolioRequest):
         )
 
     if not date_rets:
+        dropped_all = [s for s in symbols if s not in date_rets]
         return {
             "success": False,
             "strategy_id": sid,
             "message": "组合中所有标的回测失败，请确认已同步行情数据",
-        "per_symbol": per_symbol,
-        "dropped_symbols": dropped,
+            "per_symbol": per_symbol,
+            "dropped_symbols": dropped_all,
         }
 
     use_sum = notional is not None

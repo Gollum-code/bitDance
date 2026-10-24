@@ -2,9 +2,9 @@
 import { computed, onMounted, ref } from 'vue'
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
-import { Grid3x3, Play, Loader2 } from 'lucide-vue-next'
+import { Grid3x3, Play, Loader2, X } from 'lucide-vue-next'
 import { listStrategies, type StrategyListItem } from '../services/backtest'
-import { runGrid, type GridPayload } from '../services/analytics'
+import { pollJob, runGrid, submitGridJob, cancelJob, type GridPayload, type JobInfo } from '../services/analytics'
 import { defaultChartEndDate, defaultChartStartDate } from '../services/market'
 
 const strategies = ref<StrategyListItem[]>([])
@@ -20,8 +20,12 @@ const param2 = ref('slow_window')
 const values2Text = ref('20,30,40,50,60')
 
 const loading = ref(false)
+const progress = ref(0)
+const stage = ref('')
 const err = ref('')
 const data = ref<GridPayload | null>(null)
+let stopPoll: (() => void) | null = null
+let activeJobId = ref('')
 
 const paramCandidates = ['fast_window', 'slow_window', 'signal_window', 'atr_window', 'atr_mult', 'fixed_size']
 
@@ -45,23 +49,64 @@ async function run() {
   }
   loading.value = true
   err.value = ''
+  data.value = null
+  progress.value = 0
+  stage.value = '提交任务'
+  const payload = {
+    strategy_id: sid.value,
+    param_name: paramName.value,
+    values,
+    param2: use2D.value ? param2.value : undefined,
+    values2: use2D.value ? v2 : undefined,
+    vt_symbol: vtSymbol.value.trim(),
+    start: start.value,
+    end: end.value,
+  }
   try {
-    data.value = await runGrid({
-      strategy_id: sid.value,
-      param_name: paramName.value,
-      values,
-      param2: use2D.value ? param2.value : undefined,
-      values2: use2D.value ? v2 : undefined,
-      vt_symbol: vtSymbol.value.trim(),
-      start: start.value,
-      end: end.value,
+    const job = await submitGridJob(payload)
+    activeJobId.value = job.job_id
+    stage.value = '排队中'
+    await new Promise<void>((resolve, reject) => {
+      stopPoll = pollJob(job.job_id, {
+        onUpdate: (info: JobInfo) => {
+          progress.value = info.progress
+          stage.value = info.stage || info.status
+          if (info.status === 'done') {
+            data.value = info.result as GridPayload
+            resolve()
+          }
+        },
+        onDone: () => resolve(),
+        onError: (e) => reject(e),
+      })
     })
   } catch (e) {
-    err.value = e instanceof Error ? e.message : '扫描失败'
-    data.value = null
+    // 任务接口不可用时降级为同步调用
+    if (!data.value) {
+      try {
+        stage.value = '同步执行（可能较慢）'
+        data.value = await runGrid(payload)
+      } catch (e2) {
+        err.value = e2 instanceof Error ? e2.message : e instanceof Error ? e.message : '扫描失败'
+      }
+    }
   } finally {
     loading.value = false
+    if (stopPoll) {
+      stopPoll()
+      stopPoll = null
+    }
   }
+}
+
+function cancel() {
+  if (activeJobId.value) void cancelJob(activeJobId.value).catch(() => undefined)
+  stopPoll?.()
+  stopPoll = null
+  loading.value = false
+  progress.value = 0
+  stage.value = ''
+  activeJobId.value = ''
 }
 
 const heatOption = computed(() => {
@@ -188,7 +233,10 @@ onMounted(async () => {
         <button class="btn primary" :disabled="loading" @click="run">
           <Loader2 v-if="loading" class="ic spin" />
           <Play v-else class="ic" />
-          {{ loading ? '扫描中…' : '开始扫描' }}
+          {{ loading ? `扫描中 ${progress}%` : '开始扫描' }}
+        </button>
+        <button v-if="loading" class="btn ghost" @click="cancel">
+          <X class="ic" /> 取消
         </button>
       </div>
       <div class="controls">
@@ -211,6 +259,10 @@ onMounted(async () => {
         </label>
         <p class="hint">双因子模式会扫描两参数的全部组合（最多 60 格），用热力图展示总收益分布。</p>
       </div>
+      <div v-if="loading" class="progress-track">
+        <div class="progress-bar" :style="{ width: `${progress}%` }" />
+      </div>
+      <p v-if="loading && stage" class="hint">当前：{{ stage }}</p>
       <p v-if="err" class="err">{{ err }}</p>
       <p v-else-if="data" class="ok">
         {{ data.message }}<span v-if="data.cached">（缓存）</span>
@@ -299,7 +351,10 @@ onMounted(async () => {
 .fld input { width: 190px; }
 .btn { display: inline-flex; align-items: center; gap: .35rem; border: 0; border-radius: 999px; padding: .55rem 1rem; font-size: .85rem; cursor: pointer; }
 .btn.primary { background: #2563eb; color: #fff; }
+.btn.ghost { background: transparent; color: var(--bq-text); border: 1px solid rgba(255,255,255,.16); }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
+.progress-track { height: 6px; margin-top: .7rem; border-radius: 999px; background: rgba(255,255,255,.08); overflow: hidden; }
+.progress-bar { height: 100%; background: linear-gradient(90deg, #2563eb, #22d3ee); transition: width .3s; }
 .ic { width: 1rem; height: 1rem; }
 .spin { animation: sp 1s linear infinite; }
 @keyframes sp { to { transform: rotate(360deg); } }

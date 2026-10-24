@@ -1,4 +1,4 @@
-import type { MonthlyReturn, RiskGate, RiskMetrics } from './analytics'
+import type { MonteCarloResult, MonthlyReturn, RiskGate, RiskMetrics } from './analytics'
 
 export interface BacktestParams {  strategyId: string
   vtSymbol: string
@@ -15,6 +15,12 @@ export interface BacktestParams {  strategyId: string
   atrWindow: number
   atrMult: number
   fixedSize: number
+  /** 固定止损百分比（0 = 关闭） */
+  stopLossPct?: number
+  /** 固定止盈百分比（0 = 关闭） */
+  takeProfitPct?: number
+  /** 移动止损百分比（从持仓最高点回撤，0 = 关闭） */
+  trailingStopPct?: number
 }
 
 export interface BacktestStats {
@@ -125,6 +131,8 @@ export interface BacktestResult {
   risk_metrics?: RiskMetrics
   monthly_returns?: MonthlyReturn[]
   risk_gate?: RiskGate
+  /** Block bootstrap 置信区间：夏普/回撤/收益的分布 */
+  monte_carlo?: MonteCarloResult
   exposure?: {
     max_position_pct: number
     avg_position_pct: number
@@ -169,6 +177,15 @@ function toQueryParams(params: BacktestParams): URLSearchParams {
   if (params.atrWindow != null) q.set('atr_window', String(params.atrWindow))
   if (params.atrMult != null) q.set('atr_mult', String(params.atrMult))
   if (params.fixedSize != null) q.set('fixed_size', String(params.fixedSize))
+  if (params.stopLossPct != null && params.stopLossPct > 0) {
+    q.set('stop_loss_pct', String(params.stopLossPct))
+  }
+  if (params.takeProfitPct != null && params.takeProfitPct > 0) {
+    q.set('take_profit_pct', String(params.takeProfitPct))
+  }
+  if (params.trailingStopPct != null && params.trailingStopPct > 0) {
+    q.set('trailing_stop_pct', String(params.trailingStopPct))
+  }
   return q
 }
 

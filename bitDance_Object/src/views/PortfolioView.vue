@@ -2,9 +2,16 @@
 import { computed, onMounted, ref } from 'vue'
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
-import { Briefcase, Play, Loader2, Plus, Trash2 } from 'lucide-vue-next'
+import { Briefcase, Play, Loader2, Plus, Trash2, X } from 'lucide-vue-next'
 import { listStrategies, type StrategyListItem } from '../services/backtest'
-import { runPortfolio, type PortfolioPayload } from '../services/analytics'
+import {
+  cancelJob,
+  pollJob,
+  runPortfolio,
+  submitPortfolioJob,
+  type JobInfo,
+  type PortfolioPayload,
+} from '../services/analytics'
 import { defaultChartEndDate, defaultChartStartDate } from '../services/market'
 
 const strategies = ref<StrategyListItem[]>([])
@@ -17,7 +24,11 @@ const capital = ref(100000)
 
 const loading = ref(false)
 const err = ref('')
+const progress = ref(0)
+const stage = ref('')
 const data = ref<PortfolioPayload | null>(null)
+let stopPoll: (() => void) | null = null
+const activeJobId = ref('')
 
 function addSymbol() {
   if (symbols.value.length >= 10) return
@@ -114,23 +125,64 @@ async function run() {
   }
   loading.value = true
   err.value = ''
-  try {
+  data.value = null
+  progress.value = 0
+  stage.value = '提交任务'
+  const payload = {
+    strategy_id: sid.value,
+    vt_symbols: symbols.value.map((s) => s.trim()).filter(Boolean),
+    start: start.value,
+    end: end.value,
+    capital: capital.value,
     // 按目标名义金额定仓：权重 × 组合资金。
     // 不能用固定股数——一篮子标的价格可能差 300 倍，固定股数会让实际权重严重偏离设定权重。
-    data.value = await runPortfolio({
-      strategy_id: sid.value,
-      vt_symbols: symbols.value.map((s) => s.trim()).filter(Boolean),
-      start: start.value,
-      end: end.value,
-      capital: capital.value,
-      notional_per_symbol: weights.value.map((w) => (Number.isFinite(w) ? w : 0) * capital.value),
+    notional_per_symbol: weights.value.map((w) => (Number.isFinite(w) ? w : 0) * capital.value),
+  }
+  try {
+    const job = await submitPortfolioJob(payload)
+    activeJobId.value = job.job_id
+    stage.value = '排队中'
+    await new Promise<void>((resolve, reject) => {
+      stopPoll = pollJob(job.job_id, {
+        onUpdate: (info: JobInfo) => {
+          progress.value = info.progress
+          stage.value = info.stage || info.status
+          if (info.status === 'done') {
+            data.value = info.result as PortfolioPayload
+            resolve()
+          }
+        },
+        onDone: () => resolve(),
+        onError: (e) => reject(e),
+      })
     })
   } catch (e) {
-    err.value = e instanceof Error ? e.message : '组合回测失败'
-    data.value = null
+    if (!data.value) {
+      try {
+        stage.value = '同步执行（可能较慢）'
+        data.value = await runPortfolio(payload)
+      } catch (e2) {
+        err.value = e2 instanceof Error ? e2.message : e instanceof Error ? e.message : '组合回测失败'
+        data.value = null
+      }
+    }
   } finally {
     loading.value = false
+    if (stopPoll) {
+      stopPoll()
+      stopPoll = null
+    }
   }
+}
+
+function cancel() {
+  if (activeJobId.value) void cancelJob(activeJobId.value).catch(() => undefined)
+  stopPoll?.()
+  stopPoll = null
+  loading.value = false
+  progress.value = 0
+  stage.value = ''
+  activeJobId.value = ''
 }
 
 onMounted(async () => {
@@ -177,9 +229,16 @@ onMounted(async () => {
         <button class="btn primary" :disabled="loading" @click="run">
           <Loader2 v-if="loading" class="ic spin" />
           <Play v-else class="ic" />
-          {{ loading ? '回测中…' : '运行组合回测' }}
+          {{ loading ? `回测中 ${progress}%` : '运行组合回测' }}
+        </button>
+        <button v-if="loading" class="btn ghost" @click="cancel">
+          <X class="ic" /> 取消
         </button>
       </div>
+      <div v-if="loading" class="progress-track">
+        <div class="progress-bar" :style="{ width: `${progress}%` }" />
+      </div>
+      <p v-if="loading && stage" class="hint">当前：{{ stage }}</p>
 
       <div class="symbols">
         <div v-for="(s, i) in symbols" :key="i" class="sym-row">
@@ -275,7 +334,10 @@ onMounted(async () => {
 .fld input, .fld select { border: 1px solid rgba(255,255,255,.14); border-radius: .5rem; padding: .45rem .5rem; background: rgba(8,12,21,.7); color: var(--bq-text); }
 .btn { display: inline-flex; align-items: center; gap: .35rem; border: 1px solid rgba(255,255,255,.14); border-radius: 999px; padding: .5rem .9rem; font-size: .82rem; background: transparent; color: var(--bq-text); cursor: pointer; }
 .btn.primary { background: #2563eb; border-color: transparent; color: #fff; }
+.btn.ghost { background: transparent; color: var(--bq-text); border: 1px solid rgba(255,255,255,.16); }
 .btn:disabled, .icon-btn:disabled { opacity: .5; cursor: not-allowed; }
+.progress-track { height: 6px; margin-top: .7rem; border-radius: 999px; background: rgba(255,255,255,.08); overflow: hidden; }
+.progress-bar { height: 100%; background: linear-gradient(90deg, #2563eb, #22d3ee); transition: width .3s; }
 .ic { width: 1rem; height: 1rem; }
 .spin { animation: sp 1s linear infinite; }
 @keyframes sp { to { transform: rotate(360deg); } }

@@ -1,0 +1,74 @@
+# bitDance 一键部署（Docker Compose）
+#
+# 启动：
+#   docker compose up -d --build
+#   打开 http://localhost:5173
+#
+# 停止并保留数据：
+#   docker compose down
+# 停止并清空数据（vn.py 行情库 + 业务库）：
+#   docker compose down -v
+#
+# 说明：
+#   - trader(8000)：vn.py 回测引擎 + 行情源，数据卷持久化 vn.py SQLite
+#   - backend(8080)：业务后端（认证 / 社区 / 报告 / 预警）
+#   - frontend(5173)：Vite 构建产物由 nginx 托管，反向代理到两个后端
+#   - 行情数据源默认 DATA_SOURCE=free（腾讯公开接口，免 token）
+
+services:
+  trader:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.trader
+    container_name: bitdance-trader
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_SOURCE: ${DATA_SOURCE:-free}
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - vntrader-data:/root/.vntrader
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+    container_name: bitdance-backend
+    ports:
+      - "8080:8080"
+    environment:
+      BITDANCE_JWT_SECRET: ${BITDANCE_JWT_SECRET:-dev-secret-change-me}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - backend-data:/app/backend/data
+    depends_on:
+      - trader
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        # 浏览器访问的后端地址：留空表示同源（由 nginx 按路径转发，推荐）
+        VITE_API_BASE: ${VITE_API_BASE:-}
+    container_name: bitdance-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - trader
+      - backend
+    restart: unless-stopped
+
+volumes:
+  vntrader-data:
+  backend-data:

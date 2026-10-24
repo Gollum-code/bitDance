@@ -117,6 +117,18 @@ function guarded(to: string) {
           <span class="card-meta">进入 →</span>
         </RouterLink>
 
+        <RouterLink to="/analytics/walkforward" class="card">
+          <h2>前向验证 / 过拟合检测</h2>
+          <p>train/test 多折滚动验证，只在样本内选参，看样本外效率比与过拟合概率。</p>
+          <span class="card-meta">进入 →</span>
+        </RouterLink>
+
+        <RouterLink to="/analytics/factor-ic" class="card">
+          <h2>因子有效性分析</h2>
+          <p>用 IC / RankIC / IC_IR / 分组单调性检验选股因子到底有没有预测力。</p>
+          <span class="card-meta">进入 →</span>
+        </RouterLink>
+
         <RouterLink to="/analytics/realtime" class="card">
           <h2>实时行情推送</h2>
           <p>WebSocket 每 3 秒推送腾讯实时快照，展示你自选标的的最新行情。</p>

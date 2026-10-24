@@ -101,6 +101,18 @@ const router = createRouter({
       meta: { title: '参数优化' },
     },
     {
+      path: '/analytics/walkforward',
+      name: 'walk-forward',
+      component: () => import('../views/WalkForwardView.vue'),
+      meta: { title: '前向验证' },
+    },
+    {
+      path: '/analytics/factor-ic',
+      name: 'factor-ic',
+      component: () => import('../views/FactorIcView.vue'),
+      meta: { title: '因子有效性' },
+    },
+    {
       path: '/analytics/realtime',
       name: 'realtime',
       component: () => import('../views/RealtimeView.vue'),

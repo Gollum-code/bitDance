@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { MonthlyReturn, RiskGate, RiskMetrics } from '../../services/analytics'
+import type { MonteCarloResult, MonthlyReturn, RiskGate, RiskMetrics } from '../../services/analytics'
 
 const props = defineProps<{
   riskMetrics?: RiskMetrics
   monthlyReturns?: MonthlyReturn[]
   riskGate?: RiskGate
+  monteCarlo?: MonteCarloResult
 }>()
 
 const rows = computed(() => {
@@ -36,6 +37,48 @@ const rows = computed(() => {
 const monthlyRows = computed(() => (props.monthlyReturns ?? []).slice(-24))
 
 const gate = computed(() => props.riskGate)
+
+const mc = computed<MonteCarloResult | undefined>(() => {
+  const m = props.monteCarlo
+  return m && m.ok ? m : undefined
+})
+
+/** 置信区间行：左=点估计，右=95% 区间 */
+const mcRows = computed(() => {
+  const m = mc.value
+  if (!m) return []
+  const s = m.sample
+  return [
+    {
+      label: '夏普比率',
+      point: fmt(s?.sharpe, 2),
+      lo: fmt(m.sharpe?.p05, 2),
+      hi: fmt(m.sharpe?.p95, 2),
+      hint: '区间跨越 0 说明无法排除无超额收益',
+    },
+    {
+      label: '累计收益 %',
+      point: fmt(s?.total_return_pct, 2),
+      lo: fmt(m.total_return?.p05, 2),
+      hi: fmt(m.total_return?.p95, 2),
+      hint: '同样策略再跑一次，95% 概率落在此区间',
+    },
+    {
+      label: '年化收益 %',
+      point: fmt(s?.annual_return_pct, 2),
+      lo: fmt(m.annual_return?.p05, 2),
+      hi: fmt(m.annual_return?.p95, 2),
+      hint: 'block bootstrap 重采样的年化分布',
+    },
+    {
+      label: '最大回撤 %',
+      point: fmt(s?.max_drawdown_pct, 2),
+      lo: fmt(m.max_drawdown?.p05, 2),
+      hi: fmt(m.max_drawdown?.p95, 2),
+      hint: `95% 分位回撤 ${fmt(m.drawdown_p95, 2)}%——按此做风险预算更稳健`,
+    },
+  ]
+})
 
 function fmt(v: unknown, digits = 2): string {
   if (typeof v !== 'number' || !Number.isFinite(v)) return '—'
@@ -93,6 +136,27 @@ function monthColor(v: number): string {
         </li>
       </ul>
       <p v-if="gate.reasons.length" class="risk-reasons">否决原因：{{ gate.reasons.join('；') }}</p>
+    </div>
+
+    <div v-if="mc && mcRows.length" class="risk-mc">
+      <h4>
+        蒙特卡洛置信区间
+        <span class="mc-meta">{{ mc.sims }} 次 block bootstrap · 块长 {{ mc.block }} 日 · {{ Math.round((mc.confidence ?? 0.95) * 100) }}%</span>
+      </h4>
+      <div class="mc-grid">
+        <div v-for="r in mcRows" :key="r.label" class="mc-row" :title="r.hint">
+          <span class="mc-label">{{ r.label }}</span>
+          <span class="mc-point">{{ r.point }}</span>
+          <span class="mc-ci">[{{ r.lo }}, {{ r.hi }}]</span>
+        </div>
+      </div>
+      <div class="mc-probs">
+        <span>收益为正概率 <b>{{ pct((mc.total_return?.prob_positive ?? 0) * 100) }}</b></span>
+        <span>夏普为正概率 <b>{{ pct((mc.sharpe?.prob_positive ?? 0) * 100) }}</b></span>
+      </div>
+      <ul v-if="mc.interpretation?.length" class="mc-notes">
+        <li v-for="(n, i) in mc.interpretation" :key="i">{{ n }}</li>
+      </ul>
     </div>
 
     <div v-if="monthlyRows.length" class="risk-monthly">
@@ -256,6 +320,77 @@ function monthColor(v: number): string {
 
 .risk-monthly {
   margin-top: 12px;
+}
+
+.risk-mc {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(129, 156, 193, 0.18);
+}
+
+.risk-mc h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #a9bcd6;
+}
+
+.mc-meta {
+  margin-left: 8px;
+  font-weight: 400;
+  color: #7f8ea3;
+}
+
+.mc-grid {
+  display: grid;
+  gap: 4px;
+}
+
+.mc-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 12px;
+}
+
+.mc-label {
+  color: #c3d2e8;
+}
+
+.mc-point {
+  color: #e8f0fb;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.mc-ci {
+  color: #8b9bb4;
+  font-variant-numeric: tabular-nums;
+}
+
+.mc-probs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #8b9bb4;
+}
+
+.mc-probs b {
+  color: #d7e4f7;
+}
+
+.mc-notes {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: #8b9bb4;
+  font-size: 11px;
+  line-height: 1.7;
 }
 
 .month-strip {

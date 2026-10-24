@@ -46,6 +46,17 @@ def load_strategy_class(strategy_id: str):
     raise ValueError(f"strategy_id {strategy_id} not found in {manifest}")
 
 
+def load_stop_aware_strategy_class(strategy_id: str):
+    """加载族策略并动态挂上止损/止盈/移动止损。
+
+    参数默认全为 0（关闭），因此不配置止损时行为与原子策略完全一致。
+    """
+    from rewritten_strategies._family_helpers import make_stop_aware
+
+    cls, row = load_strategy_class(strategy_id)
+    return make_stop_aware(cls), row
+
+
 def build_setting(strategy_cls, manifest_row: dict, user_config: dict | None) -> dict:
     """族默认参数 + 用户覆盖。只保留策略类 parameters 中声明的键。"""
     setting: dict = {}
@@ -86,6 +97,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--atr-window", type=int, default=None)
     parser.add_argument("--atr-mult", type=float, default=None)
     parser.add_argument("--fixed-size", type=int, default=None)
+    parser.add_argument("--stop-loss-pct", type=float, default=None, help="固定止损百分比，如 5 表示 5%%")
+    parser.add_argument("--take-profit-pct", type=float, default=None, help="固定止盈百分比")
+    parser.add_argument("--trailing-stop-pct", type=float, default=None, help="移动止损百分比")
     return parser
 
 
@@ -112,11 +126,14 @@ def main(config: dict | None = None):
             atr_window=config.get("atr_window"),
             atr_mult=config.get("atr_mult"),
             fixed_size=config.get("fixed_size"),
+            stop_loss_pct=config.get("stop_loss_pct"),
+            take_profit_pct=config.get("take_profit_pct"),
+            trailing_stop_pct=config.get("trailing_stop_pct"),
         )
 
     args = parser.parse_args([] if config else None)
     sid = args.strategy_id.zfill(2)
-    strategy_cls, row = load_strategy_class(sid)
+    strategy_cls, row = load_stop_aware_strategy_class(sid)
 
     print(f"加载策略: {row['class_name']} (来源: {row['source_file']}, 类型: {row['archetype']})")
 
@@ -140,7 +157,16 @@ def main(config: dict | None = None):
         "atr_window": args.atr_window,
         "atr_mult": args.atr_mult,
         "fixed_size": args.fixed_size,
+        "stop_loss_pct": args.stop_loss_pct,
+        "take_profit_pct": args.take_profit_pct,
+        "trailing_stop_pct": args.trailing_stop_pct,
     }
+    # 透传 config 中任意策略参数（如新增止损参数、未来扩展参数）
+    if config:
+        known = set(DEFAULT_CONFIG) | set(user_overrides)
+        for key, value in config.items():
+            if key not in known and value is not None:
+                user_overrides[key] = value
     setting = build_setting(strategy_cls, row, user_overrides)
     print(f"策略参数: {setting}")
     engine.add_strategy(strategy_cls, setting)

@@ -2,7 +2,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import analytics, chooseStrategy, chat, market_data, tushareStaticsUploud
+from routers import analytics, chooseStrategy, chat, job_routes, market_data, research, tushareStaticsUploud
 
 app = FastAPI()
 app.add_middleware(
@@ -18,6 +18,8 @@ app.include_router(chat.router, prefix="/chat")
 app.include_router(market_data.router, prefix="/api/market", tags=["market"])
 app.include_router(tushareStaticsUploud.router, tags=["tushare"])
 app.include_router(analytics.router, prefix="/analytics", tags=["analytics"])
+app.include_router(research.router, prefix="/analytics", tags=["research"])
+app.include_router(job_routes.router, prefix="/analytics", tags=["jobs"])
 
 
 @app.get("/")

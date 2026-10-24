@@ -1,7 +1,18 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { Radio, RefreshCw, Wifi, WifiOff, Bell } from 'lucide-vue-next'
+import { Radio, RefreshCw, Wifi, WifiOff, Bell, Trash2, Cloud } from 'lucide-vue-next'
 import { getRealtime, openRealtimeWs, type RealtimeQuote } from '../services/analytics'
+import { useAuth } from '../state/auth'
+import {
+  checkAlerts as checkAlertsApi,
+  createAlert,
+  deleteAlert,
+  listAlerts,
+  resetAlert as resetAlertApi,
+  type AlertRule as ServerAlertRule,
+} from '../services/workspace'
+
+const auth = useAuth()
 
 const DEFAULT_WATCH = ['sh600519', 'sh601318', 'sz000858', 'sh600036', 'sz000001', 'sh601166']
 
@@ -13,18 +24,23 @@ const err = ref('')
 const lastUpdate = ref('')
 let closeFn: (() => void) | null = null
 
-interface AlertRule {
+/** 本地规则（游客态）；登录用户的规则走服务端 */
+interface LocalAlertRule {
   code: string
   kind: 'below' | 'above'
   value: number
   fired: boolean
 }
-const alertRules = ref<AlertRule[]>([])
+const localRules = ref<LocalAlertRule[]>([])
+const serverRules = ref<ServerAlertRule[]>([])
 const alertCode = ref('sh600519')
 const alertKind = ref<'below' | 'above'>('below')
 const alertValue = ref(1000)
 const alertMessage = ref('')
 const alertCount = ref(0)
+const savingAlert = ref(false)
+
+const isMember = () => auth.user.value != null
 
 function parseCodes() {
   return codes.value
@@ -46,13 +62,34 @@ function nameOf(code: string): string {
   return String(rows.value[code]?.name ?? code)
 }
 
+function quoteCode(q: RealtimeQuote): string {
+  const direct = String(q.code ?? q.symbol ?? '').toLowerCase()
+  if (direct) return direct
+  // 后端 _fetch_quotes 返回 ts_code（600519.SSE），转成腾讯代码做键
+  const ts = String(q.ts_code ?? '').toUpperCase()
+  const m = ts.match(/^(\d{6})\.(SSE|SZSE|BSE)$/)
+  if (!m) return ''
+  const prefix = { SSE: 'sh', SZSE: 'sz', BSE: 'bj' }[m[2] as 'SSE' | 'SZSE' | 'BSE']
+  return `${prefix}${m[1]}`
+}
+
 function checkAlerts(items: RealtimeQuote[]) {
   for (const q of items) {
-    const code = String(q.code ?? q.symbol ?? '')
+    const code = quoteCode(q)
     if (!code) continue
     const price = num(q, 'now', '最新价', 'price', 'close')
     if (price === null) continue
-    for (const rule of alertRules.value) {
+    // 本地规则：即时反馈
+    for (const rule of localRules.value) {
+      if (rule.code !== code || rule.fired) continue
+      const hit = rule.kind === 'below' ? price <= rule.value : price >= rule.value
+      if (!hit) continue
+      rule.fired = true
+      alertCount.value += 1
+      alertMessage.value = `${nameOf(code)} ${rule.kind === 'below' ? '跌破' : '涨超'} ${rule.value}（现价 ${price.toFixed(2)}）`
+    }
+    // 服务端规则：展示后台循环标记的触发状态
+    for (const rule of serverRules.value) {
       if (rule.code !== code || rule.fired) continue
       const hit = rule.kind === 'below' ? price <= rule.value : price >= rule.value
       if (!hit) continue
@@ -63,32 +100,94 @@ function checkAlerts(items: RealtimeQuote[]) {
   }
 }
 
-function addAlert() {
+async function refreshServerAlerts() {
+  if (!isMember()) return
+  try {
+    const res = await listAlerts()
+    serverRules.value = res.items
+    alertCount.value = res.items.filter((r) => r.fired).length
+  } catch {
+    /* 后端未启动时静默降级为本地规则 */
+  }
+}
+
+async function addAlert() {
   const code = alertCode.value.trim().toLowerCase()
-  if (!code || !alertRules.value.some((r) => r.code === code && r.kind === alertKind.value && r.value === alertValue.value)) {
-    alertRules.value.push({ code, kind: alertKind.value, value: alertValue.value, fired: false })
+  if (!code) return
+  if (isMember()) {
+    savingAlert.value = true
+    try {
+      await createAlert({ code, kind: alertKind.value, value: alertValue.value })
+      await refreshServerAlerts()
+    } catch (e) {
+      alertMessage.value = e instanceof Error ? e.message : '添加失败'
+    } finally {
+      savingAlert.value = false
+    }
+    return
+  }
+  if (!localRules.value.some((r) => r.code === code && r.kind === alertKind.value && r.value === alertValue.value)) {
+    localRules.value.push({ code, kind: alertKind.value, value: alertValue.value, fired: false })
   }
 }
 
 function removeAlert(i: number) {
-  alertRules.value.splice(i, 1)
+  localRules.value.splice(i, 1)
 }
 
-function resetAlerts() {
-  alertRules.value.forEach((r) => (r.fired = false))
+async function removeServerRule(id: number) {
+  try {
+    await deleteAlert(id)
+    await refreshServerAlerts()
+  } catch (e) {
+    alertMessage.value = e instanceof Error ? e.message : '删除失败'
+  }
+}
+
+async function resetRule(rule: ServerAlertRule) {
+  try {
+    await resetAlertApi(rule.id)
+    await refreshServerAlerts()
+  } catch (e) {
+    alertMessage.value = e instanceof Error ? e.message : '重置失败'
+  }
+}
+
+async function resetAlerts() {
+  localRules.value.forEach((r) => (r.fired = false))
+  if (isMember()) {
+    await Promise.allSettled(serverRules.value.map((r) => resetAlertApi(r.id)))
+    await refreshServerAlerts()
+  }
   alertCount.value = 0
   alertMessage.value = ''
 }
 
 function absorb(items: RealtimeQuote[]) {
   for (const q of items) {
-    const code = String(q.code ?? q.symbol ?? '')
+    const code = quoteCode(q)
     if (code) rows.value[code] = q
   }
   checkAlerts(items)
   updating.value = true
   setTimeout(() => (updating.value = false), 200)
   lastUpdate.value = new Date().toLocaleTimeString()
+}
+
+/** 手动触发一次服务端检查：后台循环之外的即时确认 */
+async function checkServerAlerts() {
+  if (!isMember()) return
+  try {
+    const res = await checkAlertsApi()
+    if (res.count > 0) {
+      const latest = res.events[res.events.length - 1]
+      alertMessage.value = latest.eventMessage
+      alertCount.value += res.count
+      await refreshServerAlerts()
+    }
+  } catch {
+    /* 后端未启动时忽略 */
+  }
 }
 
 async function refreshOnce() {
@@ -143,7 +242,9 @@ function changeText(q: RealtimeQuote) {
   return `${c !== null ? c.toFixed(2) : '—'} / ${p !== null ? `${p.toFixed(2)}%` : '—'}`
 }
 
-onMounted(() => {
+onMounted(async () => {
+  await auth.init()
+  await refreshServerAlerts()
   void refreshOnce()
   connect()
 })
@@ -185,6 +286,9 @@ onUnmounted(disconnect)
       <h2 class="h2">
         <Bell class="ic" /> 价格预警
         <span v-if="alertCount" class="alert-badge">{{ alertCount }}</span>
+        <span v-if="isMember()" class="cloud-badge" title="规则保存在服务端，后台每 30 秒检查，关掉页面也会触发">
+          <Cloud class="ic-xs" /> 服务端模式
+        </span>
       </h2>
       <div class="alert-form">
         <input v-model="alertCode" class="mono" placeholder="sh600519" />
@@ -193,19 +297,33 @@ onUnmounted(disconnect)
           <option value="above">涨超</option>
         </select>
         <input v-model.number="alertValue" type="number" placeholder="阈值" />
-        <button class="btn" @click="addAlert">添加规则</button>
+        <button class="btn" :disabled="savingAlert" @click="addAlert">添加规则</button>
         <button class="btn" @click="resetAlerts">重置触发</button>
       </div>
       <p v-if="alertMessage" class="alert-hit">{{ alertMessage }}</p>
-      <ul v-if="alertRules.length" class="alert-list">
-        <li v-for="(rule, i) in alertRules" :key="i">
+      <ul v-if="isMember() && serverRules.length" class="alert-list">
+        <li v-for="rule in serverRules" :key="rule.id">
+          <span class="mono">{{ rule.code }}</span>
+          <span>{{ rule.kind === 'below' ? '跌破' : '涨超' }} {{ rule.value }}</span>
+          <span :class="rule.fired ? 'hit' : 'idle'">{{ rule.fired ? '已触发' : '监控中' }}</span>
+          <button class="mini" @click="resetRule(rule)">重置</button>
+          <button class="rm" @click="removeServerRule(rule.id)">
+            <Trash2 class="ic-xs" />
+          </button>
+        </li>
+      </ul>
+      <ul v-else-if="localRules.length" class="alert-list">
+        <li v-for="(rule, i) in localRules" :key="i">
           <span class="mono">{{ rule.code }}</span>
           <span>{{ rule.kind === 'below' ? '跌破' : '涨超' }} {{ rule.value }}</span>
           <span :class="rule.fired ? 'hit' : 'idle'">{{ rule.fired ? '已触发' : '监控中' }}</span>
           <button class="rm" @click="removeAlert(i)">×</button>
         </li>
       </ul>
-      <p class="hint">规则在每次行情推送时自动检测，命中即标记（WS 连接期间有效）。</p>
+      <p v-if="!localRules.length && !serverRules.length" class="hint">
+        还没有预警规则。{{ isMember() ? '登录用户：规则存服务端，后台每 30 秒检查，关掉页面也会触发。' : '未登录：规则只在当前页面有效，登录后可保存到服务端。' }}
+      </p>
+      <p class="hint">规则在每次行情推送时自动检测，命中即标记。</p>
     </section>
 
     <section class="panel">

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -30,6 +32,9 @@ JWT_EXPIRES_SECONDS = int(os.getenv("BITDANCE_JWT_EXPIRES", "604800"))  # 7 days
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
+logger = logging.getLogger("bitdance.backend")
+
+_alert_task: asyncio.Task | None = None
 
 
 def get_db() -> sqlite3.Connection:
@@ -93,6 +98,69 @@ def init_db() -> None:
                 PRIMARY KEY (comment_id, user_id)
             )
             """
+        )
+        # 回测报告历史：原先只存浏览器 localStorage，换设备即丢且无法多端同步
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backtest_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL,
+                preview TEXT NOT NULL DEFAULT '',
+                stats TEXT NOT NULL DEFAULT '{}',
+                params TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_backtest_reports_user ON backtest_reports(user_id, created_at DESC)"
+        )
+        # 纸面交易持仓：服务端保存才能在别的设备/刷新后继续
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                strategy_id TEXT NOT NULL,
+                vt_symbol TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT 'long',
+                entry_price REAL NOT NULL,
+                entry_date TEXT NOT NULL,
+                capital REAL NOT NULL DEFAULT 0,
+                note TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                exit_price REAL NULL,
+                exit_date TEXT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_positions_user ON paper_positions(user_id, status, created_at DESC)"
+        )
+        # 价格预警规则：原先纯前端 setInterval，关页面即失效
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'below',
+                value REAL NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                fired INTEGER NOT NULL DEFAULT 0,
+                last_fired_at INTEGER NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, code, kind, value)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alert_rules_user ON alert_rules(user_id, fired, created_at DESC)"
         )
         # 老库兼容：users 缺 member 列时补上
         cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
@@ -330,8 +398,20 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def _on_startup() -> None:
+async def _on_startup() -> None:
     init_db()
+    # 价格预警后台检查：每 30 秒拉一次 trader 实时快照，命中即标记 fired。
+    # 放在后台任务里，用户关掉浏览器也能触发（前端通过 /api/alerts 拉取结果）。
+    global _alert_task
+    _alert_task = asyncio.create_task(_alert_loop())
+
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    global _alert_task
+    if _alert_task is not None:
+        _alert_task.cancel()
+        _alert_task = None
 
 
 @app.exception_handler(HTTPException)
@@ -508,6 +588,9 @@ class BacktestRunBody(BaseModel):
     atrWindow: Optional[int] = None
     atrMult: Optional[float] = None
     fixedSize: Optional[int] = None
+    stopLossPct: Optional[float] = None
+    takeProfitPct: Optional[float] = None
+    trailingStopPct: Optional[float] = None
 
 
 def _build_strategy_query(payload: dict) -> str:
@@ -531,6 +614,8 @@ def _build_strategy_query(payload: dict) -> str:
         ("fastWindow", "fast_window"), ("slowWindow", "slow_window"),
         ("signalWindow", "signal_window"), ("atrWindow", "atr_window"),
         ("atrMult", "atr_mult"), ("fixedSize", "fixed_size"),
+        ("stopLossPct", "stop_loss_pct"), ("takeProfitPct", "take_profit_pct"),
+        ("trailingStopPct", "trailing_stop_pct"),
     ]:
         if payload.get(src) is not None:
             q[dst] = str(payload[src])
@@ -826,3 +911,387 @@ async def tushare_upload_csv(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"上传转发失败: {exc}") from exc
 
+
+# ---- 回测报告历史（服务端持久化，替代 localStorage） ----
+
+class ReportCreateBody(BaseModel):
+    title: str = Field("", max_length=200)
+    body: str = Field(..., min_length=1)
+    preview: str = Field("", max_length=400)
+    stats: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+def _report_dto(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "title": str(row["title"] or ""),
+        "body": str(row["body"]),
+        "preview": str(row["preview"] or ""),
+        "stats": json.loads(row["stats"] or "{}"),
+        "params": json.loads(row["params"] or "{}"),
+        "createdAt": int(row["created_at"]),
+    }
+
+
+@app.get("/api/reports")
+def list_reports(limit: int = 50, user: AuthedUser = Depends(get_current_user)):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM backtest_reports WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user.id, max(1, min(limit, 200))),
+        ).fetchall()
+        return {"items": [_report_dto(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/reports")
+def create_report(body: ReportCreateBody, user: AuthedUser = Depends(get_current_user)):
+    preview = body.preview or body.body.strip()[:200]
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO backtest_reports (user_id, title, body, preview, stats, params, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user.id,
+                body.title.strip(),
+                body.body.strip(),
+                preview,
+                json.dumps(body.stats, ensure_ascii=False),
+                json.dumps(body.params, ensure_ascii=False),
+                int(time.time()),
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM backtest_reports WHERE id = ?", (int(cur.lastrowid),)).fetchone()
+        return _report_dto(row)
+    finally:
+        conn.close()
+
+
+@app.delete("/api/reports/{report_id}")
+def delete_report(report_id: int, user: AuthedUser = Depends(get_current_user)):
+    conn = get_db()
+    try:
+        cur = conn.execute("DELETE FROM backtest_reports WHERE id = ? AND user_id = ?", (report_id, user.id))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="报告不存在")
+        return {"deleted": True, "id": str(report_id)}
+    finally:
+        conn.close()
+
+
+# ---- 纸面交易持仓（服务端账本） ----
+
+class PaperPositionBody(BaseModel):
+    strategyId: str = Field(..., max_length=8)
+    vtSymbol: str = Field(..., max_length=32)
+    side: str = Field("long", pattern="^(long|short)$")
+    entryPrice: float = Field(..., gt=0)
+    entryDate: str = Field(..., max_length=10)
+    capital: float = Field(0, ge=0)
+    note: str = Field("", max_length=500)
+
+
+class PaperCloseBody(BaseModel):
+    exitPrice: float = Field(..., gt=0)
+    exitDate: Optional[str] = Field(None, max_length=10)
+
+
+def _paper_dto(row: Any) -> dict[str, Any]:
+    entry = float(row["entry_price"])
+    exit_price = None if row["exit_price"] is None else float(row["exit_price"])
+    ret = None
+    if exit_price is not None and entry > 0:
+        ret = (exit_price / entry - 1.0) * 100.0 if row["side"] == "long" else (entry / exit_price - 1.0) * 100.0
+    return {
+        "id": int(row["id"]),
+        "strategyId": str(row["strategy_id"]),
+        "vtSymbol": str(row["vt_symbol"]),
+        "side": str(row["side"]),
+        "entryPrice": entry,
+        "entryDate": str(row["entry_date"]),
+        "capital": float(row["capital"]),
+        "note": str(row["note"]),
+        "status": str(row["status"]),
+        "exitPrice": exit_price,
+        "exitDate": None if row["exit_date"] is None else str(row["exit_date"]),
+        "returnPct": None if ret is None else round(ret, 4),
+        "createdAt": int(row["created_at"]),
+        "updatedAt": int(row["updated_at"]),
+    }
+
+
+@app.get("/api/paper/positions")
+def paper_positions(status: str = "", user: AuthedUser = Depends(get_current_user)):
+    conn = get_db()
+    try:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM paper_positions WHERE user_id = ? AND status = ? ORDER BY created_at DESC",
+                (user.id, status),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM paper_positions WHERE user_id = ? ORDER BY created_at DESC",
+                (user.id,),
+            ).fetchall()
+        return {"items": [_paper_dto(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/paper/positions")
+def paper_create(body: PaperPositionBody, user: AuthedUser = Depends(get_current_user)):
+    now = int(time.time())
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO paper_positions
+              (user_id, strategy_id, vt_symbol, side, entry_price, entry_date, capital, note, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+            """,
+            (
+                user.id,
+                body.strategyId,
+                body.vtSymbol,
+                body.side,
+                body.entryPrice,
+                body.entryDate,
+                body.capital,
+                body.note,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM paper_positions WHERE id = ?", (int(cur.lastrowid),)).fetchone()
+        return _paper_dto(row)
+    finally:
+        conn.close()
+
+
+@app.post("/api/paper/positions/{position_id}/close")
+def paper_close(position_id: int, body: PaperCloseBody, user: AuthedUser = Depends(get_current_user)):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM paper_positions WHERE id = ? AND user_id = ?", (position_id, user.id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="持仓不存在")
+        if row["status"] != "open":
+            raise HTTPException(status_code=409, detail="该持仓已平仓")
+        conn.execute(
+            "UPDATE paper_positions SET status='closed', exit_price=?, exit_date=?, updated_at=? WHERE id=?",
+            (
+                body.exitPrice,
+                body.exitDate or time.strftime("%Y-%m-%d"),
+                int(time.time()),
+                position_id,
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM paper_positions WHERE id = ?", (position_id,)).fetchone()
+        return _paper_dto(row)
+    finally:
+        conn.close()
+
+
+@app.delete("/api/paper/positions/{position_id}")
+def paper_delete(position_id: int, user: AuthedUser = Depends(get_current_user)):
+    conn = get_db()
+    try:
+        cur = conn.execute("DELETE FROM paper_positions WHERE id = ? AND user_id = ?", (position_id, user.id))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="持仓不存在")
+        return {"deleted": True}
+    finally:
+        conn.close()
+
+
+# ---- 价格预警（服务端规则 + 后台检查） ----
+
+class AlertBody(BaseModel):
+    code: str = Field(..., min_length=2, max_length=16, description="sh600519 或 600519.SSE")
+    kind: str = Field("below", pattern="^(below|above)$")
+    value: float = Field(..., gt=0)
+    message: str = Field("", max_length=200)
+
+
+def _normalize_tx_code(code: str) -> str:
+    raw = code.strip().lower()
+    if re.match(r"^(sh|sz|bj)\d{6}$", raw):
+        return raw
+    m = re.match(r"^(\d{6})\.(sse|szse|bse|sh|sz|bj)$", raw)
+    if m:
+        suffix = {"sse": "sh", "sh": "sh", "szse": "sz", "sz": "sz", "bse": "bj", "bj": "bj"}[m.group(2)]
+        return f"{suffix}{m.group(1)}"
+    raise HTTPException(status_code=400, detail="代码格式应为 sh600519 或 600519.SSE")
+
+
+def _alert_dto(row: Any) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "code": str(row["code"]),
+        "kind": str(row["kind"]),
+        "value": float(row["value"]),
+        "message": str(row["message"]),
+        "fired": bool(row["fired"]),
+        "lastFiredAt": row["last_fired_at"],
+        "createdAt": int(row["created_at"]),
+    }
+
+
+def _trader_quotes(codes: list[str]) -> dict[str, dict[str, Any]]:
+    """从 trader(8000) 的实时快照接口取价，返回 code -> quote。"""
+    import urllib.parse
+    import urllib.request
+
+    if not codes:
+        return {}
+    qs = urllib.parse.urlencode({"symbols": ",".join(codes)})
+    try:
+        with urllib.request.urlopen(f"http://localhost:8000/analytics/realtime?{qs}", timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for item in data.get("items") or []:
+        ts = str(item.get("ts_code", "")).upper()
+        # 600519.SSE -> sh600519
+        m = re.match(r"^(\d{6})\.(SSE|SZSE|BSE)$", ts)
+        if not m:
+            continue
+        prefix = {"SSE": "sh", "SZSE": "sz", "BSE": "bj"}[m.group(2)]
+        out[f"{prefix}{m.group(1)}"] = item
+    return out
+
+
+def _evaluate_alerts(user_id: int | None = None) -> list[dict[str, Any]]:
+    """检查预警规则，命中则标记 fired 并返回事件。后台循环与手动检查共用。"""
+    conn = get_db()
+    try:
+        if user_id is None:
+            rows = conn.execute("SELECT * FROM alert_rules WHERE fired = 0").fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM alert_rules WHERE user_id = ? AND fired = 0", (user_id,)).fetchall()
+        if not rows:
+            return []
+        quotes = _trader_quotes(sorted({str(r["code"]) for r in rows}))
+        now = int(time.time())
+        events: list[dict[str, Any]] = []
+        for r in rows:
+            q = quotes.get(str(r["code"]))
+            if not q:
+                continue
+            price = float(q.get("now") or 0)
+            if price <= 0:
+                continue
+            hit = price <= float(r["value"]) if r["kind"] == "below" else price >= float(r["value"])
+            if not hit:
+                continue
+            conn.execute(
+                "UPDATE alert_rules SET fired = 1, last_fired_at = ? WHERE id = ?",
+                (now, int(r["id"])),
+            )
+            events.append({
+                **_alert_dto(r),
+                "fired": True,
+                "lastFiredAt": now,
+                "price": price,
+                "name": str(q.get("name", "")),
+                "eventMessage": str(r["message"] or f"{r['code']} {'跌破' if r['kind'] == 'below' else '突破'} {r['value']}，现价 {price:.2f}"),
+            })
+        conn.commit()
+        return events
+    finally:
+        conn.close()
+
+
+@app.get("/api/alerts")
+def list_alerts(user: AuthedUser = Depends(get_current_user)):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM alert_rules WHERE user_id = ? ORDER BY created_at DESC", (user.id,)
+        ).fetchall()
+        return {"items": [_alert_dto(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/alerts")
+def create_alert(body: AlertBody, user: AuthedUser = Depends(get_current_user)):
+    code = _normalize_tx_code(body.code)
+    conn = get_db()
+    try:
+        try:
+            cur = conn.execute(
+                "INSERT INTO alert_rules (user_id, code, kind, value, message, fired, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                (user.id, code, body.kind, body.value, body.message, int(time.time())),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail="相同预警规则已存在")
+        row = conn.execute("SELECT * FROM alert_rules WHERE id = ?", (int(cur.lastrowid),)).fetchone()
+        return _alert_dto(row)
+    finally:
+        conn.close()
+
+
+@app.patch("/api/alerts/{alert_id}")
+def reset_alert(alert_id: int, user: AuthedUser = Depends(get_current_user)):
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "UPDATE alert_rules SET fired = 0, last_fired_at = NULL WHERE id = ? AND user_id = ?",
+            (alert_id, user.id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="预警不存在")
+        row = conn.execute("SELECT * FROM alert_rules WHERE id = ?", (alert_id,)).fetchone()
+        return _alert_dto(row)
+    finally:
+        conn.close()
+
+
+@app.delete("/api/alerts/{alert_id}")
+def delete_alert(alert_id: int, user: AuthedUser = Depends(get_current_user)):
+    conn = get_db()
+    try:
+        cur = conn.execute("DELETE FROM alert_rules WHERE id = ? AND user_id = ?", (alert_id, user.id))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="预警不存在")
+        return {"deleted": True}
+    finally:
+        conn.close()
+
+
+@app.post("/api/alerts/check")
+def check_alerts(user: AuthedUser = Depends(get_current_user)):
+    events = _evaluate_alerts(user.id)
+    return {"events": events, "count": len(events)}
+
+async def _alert_loop() -> None:
+    """后台预警检查循环。异常不退出，下一轮继续。"""
+    while True:
+        try:
+            events = await asyncio.to_thread(_evaluate_alerts, None)
+            if events:
+                logger.info("price alerts fired: %s", len(events))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("alert loop error: %r", exc)
+        await asyncio.sleep(30)

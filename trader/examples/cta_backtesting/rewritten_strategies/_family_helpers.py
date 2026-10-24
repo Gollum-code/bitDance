@@ -167,3 +167,156 @@ def kama(close: np.ndarray, window: int = 10) -> float:
     for i in range(-window + 1, 0):
         val = alpha * close[i] + (1 - alpha) * val
     return val
+
+
+# ---------------- 止损 / 止盈 / 移动止损 ----------------
+
+STOP_PARAMETERS = ("stop_loss_pct", "take_profit_pct", "trailing_stop_pct")
+
+
+class StopManager:
+    """持仓保护状态机：固定止损 + 固定止盈 + 移动止损。
+
+    参数单位是**百分比**（5.0 表示 5%），0 表示该规则关闭。
+    所有判断基于收盘价，保证回测可复现、不依赖盘中 tick。
+
+    优先级：止损 > 移动止损 > 止盈。
+    先判亏损保护，避免同一根 bar 同时触发止盈/止损时取错方向。
+    """
+
+    def __init__(
+        self,
+        stop_loss_pct: float = 0.0,
+        take_profit_pct: float = 0.0,
+        trailing_stop_pct: float = 0.0,
+    ) -> None:
+        self.stop_loss_pct = max(0.0, float(stop_loss_pct or 0.0))
+        self.take_profit_pct = max(0.0, float(take_profit_pct or 0.0))
+        self.trailing_stop_pct = max(0.0, float(trailing_stop_pct or 0.0))
+        self.direction = 0          # 1 多 / -1 空 / 0 空仓
+        self.entry_price = 0.0
+        self.peak = 0.0             # 多头持仓期最高价
+        self.trough = 0.0           # 空头持仓期最低价
+        self.last_reason: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return any(v > 0 for v in (self.stop_loss_pct, self.take_profit_pct, self.trailing_stop_pct))
+
+    def on_open(self, is_long: bool, price: float) -> None:
+        self.direction = 1 if is_long else -1
+        self.entry_price = float(price)
+        self.peak = float(price)
+        self.trough = float(price)
+        self.last_reason = None
+
+    def on_close(self) -> None:
+        self.direction = 0
+        self.entry_price = 0.0
+        self.peak = 0.0
+        self.trough = 0.0
+
+    def check(self, price: float, pos: int) -> str | None:
+        """返回触发原因（stop_loss / take_profit / trailing_stop），未触发返回 None。"""
+        if not self.enabled or pos == 0 or price <= 0:
+            return None
+        direction = 1 if pos > 0 else -1
+        if self.direction != direction or self.entry_price <= 0:
+            # 容错：策略通过非 trade 回调直接改变持仓时，用首个可见价补记成本
+            self.on_open(direction > 0, price)
+
+        if direction > 0:
+            pnl_pct = (price / self.entry_price - 1.0) * 100.0
+            self.peak = max(self.peak, price)
+            trail_pct = (price / self.peak - 1.0) * 100.0 if self.peak > 0 else 0.0
+        else:
+            pnl_pct = (self.entry_price / price - 1.0) * 100.0
+            self.trough = min(self.trough, price) if self.trough > 0 else price
+            trail_pct = (price / self.trough - 1.0) * 100.0 if self.trough > 0 else 0.0
+
+        reason = None
+        if self.stop_loss_pct > 0 and pnl_pct <= -self.stop_loss_pct:
+            reason = "stop_loss"
+        elif self.trailing_stop_pct > 0 and trail_pct <= -self.trailing_stop_pct:
+            reason = "trailing_stop"
+        elif self.take_profit_pct > 0 and pnl_pct >= self.take_profit_pct:
+            reason = "take_profit"
+
+        if reason:
+            self.last_reason = reason
+        return reason
+
+
+def _trade_is_open(trade: object) -> bool:
+    offset = getattr(trade, "offset", None)
+    text = str(getattr(offset, "value", offset)).upper()
+    return "OPEN" in text or "开" in str(offset)
+
+
+def _trade_is_long(trade: object) -> bool:
+    direction = getattr(trade, "direction", None)
+    text = str(getattr(direction, "value", direction)).upper()
+    return "LONG" in text or "多" in str(direction)
+
+
+def make_stop_aware(strategy_cls: type) -> type:
+    """给任意 CtaTemplate 族策略动态挂上 StopManager。
+
+    不修改 23 个族策略源码，统一在加载时套一层子类：
+      - 新增 stop_loss_pct / take_profit_pct / trailing_stop_pct 参数（默认 0 = 关闭）
+      - on_trade 记录开平仓成本
+      - on_bar 在策略自身信号之前检查止损（亏损保护优先）
+    默认全关闭时行为与原子策略**完全一致**。
+    """
+
+    existing = set(getattr(strategy_cls, "parameters", []) or [])
+    base_vars = list(getattr(strategy_cls, "variables", []) or [])
+
+    class StopAware(strategy_cls):  # type: ignore[misc, valid-type]
+        stop_loss_pct = 0.0
+        take_profit_pct = 0.0
+        trailing_stop_pct = 0.0
+
+        parameters = list(getattr(strategy_cls, "parameters", []) or []) + [
+            p for p in STOP_PARAMETERS if p not in existing
+        ]
+        variables = base_vars + ["stop_state"]
+
+        def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
+            super().__init__(cta_engine, strategy_name, vt_symbol, setting)
+            self._stop = StopManager(
+                getattr(self, "stop_loss_pct", 0.0),
+                getattr(self, "take_profit_pct", 0.0),
+                getattr(self, "trailing_stop_pct", 0.0),
+            )
+            self.stop_state = "idle"
+
+        def on_trade(self, trade) -> None:
+            parent = getattr(super(), "on_trade", None)
+            if callable(parent):
+                parent(trade)
+            price = float(getattr(trade, "price", 0) or 0)
+            if _trade_is_open(trade):
+                self._stop.on_open(_trade_is_long(trade), price)
+            else:
+                self._stop.on_close()
+
+        def on_bar(self, bar) -> None:
+            if self.pos != 0:
+                reason = self._stop.check(bar.close_price, self.pos)
+                if reason:
+                    self.cancel_all()
+                    self.stop_state = reason
+                    price = bar.close_price
+                    if self.pos > 0:
+                        self.sell(price, abs(self.pos))
+                    else:
+                        self.cover(price, abs(self.pos))
+                    self.put_event()
+                    return
+            super().on_bar(bar)
+
+    StopAware.__name__ = f"StopAware{strategy_cls.__name__}"
+    StopAware.__qualname__ = StopAware.__name__
+    StopAware.__doc__ = getattr(strategy_cls, "__doc__", None)
+    return StopAware

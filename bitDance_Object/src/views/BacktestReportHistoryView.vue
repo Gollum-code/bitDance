@@ -5,8 +5,8 @@ import { marked } from 'marked'
 import { FileDown, Trash2 } from 'lucide-vue-next'
 import { useAuth } from '../state/auth'
 import {
-  listBacktestReports,
-  removeBacktestReport,
+  removeReportEverywhere,
+  syncReportsFromServer,
   type BacktestReportHistoryEntry,
 } from '../state/backtestReportHistory'
 
@@ -52,13 +52,14 @@ function statsOf(item: BacktestReportHistoryEntry, key: string) {
   return item.stats?.[key]
 }
 
-function load() {
+async function load() {
   const uid = userId.value
   if (uid == null) {
     items.value = []
     return
   }
-  items.value = listBacktestReports(uid)
+  // 优先服务端（多端一致）；失败自动降级到本地缓存
+  items.value = await syncReportsFromServer(uid)
 }
 
 function formatTime(ts: number) {
@@ -88,12 +89,12 @@ function toggleExpand(id: string) {
   expandedId.value = expandedId.value === id ? null : id
 }
 
-function handleRemove(id: string) {
+async function handleRemove(id: string) {
   const uid = userId.value
   if (uid == null) return
-  removeBacktestReport(uid, id)
+  await removeReportEverywhere(uid, id)
   if (expandedId.value === id) expandedId.value = null
-  load()
+  await load()
 }
 
 async function handleExport(item: BacktestReportHistoryEntry) {
