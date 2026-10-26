@@ -14,7 +14,8 @@
 - **不确定性量化**：Block Bootstrap 蒙特卡洛，给出夏普 / 年化收益 / 最大回撤的 95% 置信区间与逐日置信带，区分「实力」与「样本运气」
 - **风险与风控**：独立风险模块（纯函数）补齐下行风险与尾部风险——索提诺 / Calmar / 溃疡指数 / 历史模拟法 VaR / CVaR / 偏度峰度 / 月度收益分布，配套**确定性风控闸门**（仓位 / 回撤 / VaR / 波动硬阈值逐条判定 + 一票否决）；参数寻优默认按夏普排序
 - **持仓保护**：23 个族策略统一挂载固定止损 / 固定止盈 / 移动止损（默认关闭，不影响原策略行为），回测与纸面交易共用同一套逻辑
-- **多维分析**：多策略对比、因子选股、参数网格优化（单参数 + 双因子热力图）、组合回测、纸面交易、市场热力图
+- **多维分析**：多策略对比、因子选股、参数网格优化（单参数 + 双因子热力图 + 止损维度）、组合回测、纸面交易、市场热力图
+- **组合权重优化**：风险平价 / 最小方差 / 最大夏普（long-only，纯 numpy 投影梯度/坐标下降），并给出风险贡献占比验证
 - **因子有效性**：IC / RankIC / IC_IR / t 值 / 分组收益单调性，检验选股因子是否真有预测力，而不是只信拍脑袋的权重
 - **免费行情**：腾讯公开接口（免 token）提供全市场列表、日线、分钟线与实时快照，支持 TuShare 切换
 - **智能辅助**：Kimi 驱动的回测报告生成、报告对比、AI 问答
@@ -61,9 +62,10 @@ bitDance/
 │  │  ├─ monte_carlo.py                   # ★ Block Bootstrap 置信区间 + 参数曲面稳定性
 │  │  ├─ walk_forward.py                  # ★ 滚动前向验证（样本外效率比/过拟合概率）
 │  │  ├─ factor_ic.py                     # ★ 因子 IC / IC_IR / 分组收益（纯函数）
+│  │  ├─ portfolio_optimizer.py           # ★ 风险平价/最小方差/最大夏普（纯 numpy）
 │  │  ├─ trade_analytics.py               # 逐笔成交/FIFO回合/信号质量/日度敞口
 │  │  └─ run_rewritten_strategy_backtest.py
-│  └─ tests/                              # 回测引擎 + 风险指标 + 分析/研究模块 pytest（86 用例）
+│  └─ tests/                              # 回测引擎 + 风险指标 + 分析/研究模块 pytest（94 用例）
 └─ bitDance_Object/
    ├─ package.json                        # 前端依赖与脚本
    ├─ vite.config.ts                      # 代理：/strategy /chat /api/market→8000，/api→8080
@@ -85,9 +87,10 @@ bitDance/
 - 使用 FastAPI 启动 API 服务（默认 `0.0.0.0:8000`）
 - 已注册路由：
   - `/strategy/list`、`/strategy/{id}`：策略清单与真实 vn.py 回测（支持止损/止盈/移动止损参数）
-  - `/analytics/*`：多策略对比、因子选股、参数网格优化、组合回测、纸面交易、市场热力图、实时行情（含 WebSocket 推送）
+  - `/analytics/*`：多策略对比、因子选股、参数网格优化（含止损维度）、组合回测、组合权重优化、纸面交易、市场热力图、实时行情（含 WebSocket 推送）
   - `/analytics/walk-forward`、`/analytics/stability`：前向验证与参数稳定性/过拟合检测
   - `/analytics/factor-ic`：因子 IC / RankIC / IC_IR / 分组收益
+  - `/analytics/optimize`：组合权重优化（风险平价 / 最小方差 / 最大夏普 / 等权）
   - `/analytics/jobs/*`：异步任务提交、进度轮询、取消（compare / grid / portfolio / walk-forward）
   - `/chat/*`：Kimi 智能对话（需 `MOONSHOT_API_KEY`）
   - `/api/market/*`：行情（股票列表/日线/分钟线/同步 vn.py/批量同步）
@@ -204,6 +207,27 @@ IC_IR = IC 均值 / IC 标准差，衡量预测力的**稳定性**——单期 I
 刻意**不引入 Redis / Celery**：单机演示项目用进程内队列，换来零部署成本。
 结果保留 1 小时，超量按完成时间淘汰，内存不会无限增长。
 同步接口全部保留，任务接口不可用时前端自动降级。
+
+### 8) 参数网格的止损维度与稳定性复用
+
+- `param_name` 现在支持 `stop_loss_pct` / `take_profit_pct` / `trailing_stop_pct`，
+  可直接扫「均线窗口 × 止损幅度」或单参数止损曲线；止损值允许 `0`（关闭）
+- 网格页新增「检测参数稳定性」：把已扫出的 `value/score` 直接传给
+  `/analytics/stability` 的 `precomputed_scores`，**不重复跑回测**，
+  只做参数曲面平滑度判断（孤立尖峰 = 过拟合风险高）
+
+### 9) 组合权重优化（`portfolio_optimizer.py`）
+
+`POST /analytics/optimize` 用最近 N 个交易日的日收益估计年化 `mu / cov`，给出 long-only 权重：
+| method | 做法 |
+|--------|------|
+| `risk_parity` | 坐标下降解 `a·w_i² + b·w_i - c = 0`，使每只标的的风险贡献相等 |
+| `min_variance` | 单纯形投影梯度下降最小化 `w'Σw` |
+| `max_sharpe` | 投影梯度上升 + 回溯线搜索最大化 `(w'μ-rf)/√(w'Σw)` |
+| `equal` | 等权基准 |
+
+返回权重、年化收益/波动/夏普、分散化比率、**每只标的的风险贡献占比**（可验证风险平价是否真的平价），
+并附等权对照组。口径提醒：权重基于回看窗口历史数据，存在样本内偏差，应作为起点而非未来最优解。
 
 ## 快速开始
 
@@ -357,7 +381,7 @@ python trader/main.py
 | Job | 内容 |
 |-----|------|
 | `python-backend` | 编译检查 + 后端 8080 接口冒烟测试（7 用例，含报告/持仓/预警） |
-| `python-trader` | 编译检查 + 回测引擎 + 风险指标 + 研究模块测试（86 用例） |
+| `python-trader` | 编译检查 + 回测引擎 + 风险指标 + 研究模块测试（94 用例） |
 | `frontend` | `vue-tsc --noEmit` 类型检查 + `npm run build` |
 
 本地运行测试：

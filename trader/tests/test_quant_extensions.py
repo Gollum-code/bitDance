@@ -23,6 +23,14 @@ from monte_carlo import (  # noqa: E402
     monte_carlo_summary,
     parameter_stability,
 )
+from portfolio_optimizer import (  # noqa: E402
+    max_sharpe_weights,
+    min_variance_weights,
+    optimize_weights,
+    portfolio_performance,
+    project_simplex,
+    risk_parity_weights,
+)
 from rewritten_strategies._family_helpers import StopManager, make_stop_aware  # noqa: E402
 from walk_forward import run_walk_forward, split_walk_forward  # noqa: E402
 
@@ -263,3 +271,66 @@ def test_make_stop_aware_adds_parameters():
     for p in cls.parameters:
         assert p in wrapped.parameters
     assert issubclass(wrapped, cls)
+
+
+# ---------------- 组合权重优化 ----------------
+
+def test_project_simplex_sums_to_one_and_non_negative():
+    out = project_simplex([3.0, -1.0, 2.0, 0.0])
+    assert np.isclose(out.sum(), 1.0)
+    assert np.all(out >= -1e-12)
+
+
+def test_min_variance_inverse_variance_for_diagonal_cov():
+    cov = np.diag([0.04, 0.01])
+    w = min_variance_weights(cov)
+    # 对角协方差下最小方差 = 逆方差权重：[1/0.04, 1/0.01] 归一化
+    assert np.allclose(w, np.array([0.2, 0.8]), atol=1e-6)
+
+
+def test_risk_parity_inverse_vol_for_diagonal_cov():
+    cov = np.diag([0.04, 0.01])
+    w = risk_parity_weights(cov)
+    # 风险平价 = 逆波动率权重：[1/0.2, 1/0.1] 归一化
+    assert np.allclose(w, np.array([1 / 3, 2 / 3]), atol=1e-5)
+
+
+def test_risk_parity_equal_for_equal_variance():
+    cov = np.diag([0.04, 0.04, 0.04])
+    w = risk_parity_weights(cov)
+    assert np.allclose(w, np.array([1 / 3, 1 / 3, 1 / 3]), atol=1e-5)
+
+
+def test_max_sharpe_prefers_higher_risk_adjusted_asset():
+    mu = np.array([0.05, 0.20])
+    cov = np.diag([0.04, 0.01])
+    w = max_sharpe_weights(mu, cov, risk_free=0.02)
+    assert np.isclose(w.sum(), 1.0)
+    assert np.all(w >= 0)
+    assert w[1] > w[0]  # 收益更高、波动更低 → 权重更高
+
+
+def test_max_sharpe_all_negative_excess_falls_back_to_min_variance():
+    mu = np.array([-0.1, -0.05])
+    cov = np.diag([0.04, 0.01])
+    w = max_sharpe_weights(mu, cov, risk_free=0.02)
+    assert np.isclose(w.sum(), 1.0)
+    assert np.allclose(w, np.array([0.2, 0.8]), atol=1e-5)
+
+
+def test_optimize_weights_dispatch_and_performance():
+    mu = np.array([0.10, 0.12, 0.08])
+    cov = np.diag([0.04, 0.09, 0.01])
+    for method in ("equal", "risk_parity", "min_variance", "max_sharpe"):
+        w = optimize_weights(method, mu, cov, risk_free=0.02)
+        assert w.size == 3
+        assert np.isclose(w.sum(), 1.0)
+        assert np.all(w >= -1e-12)
+        perf = portfolio_performance(w, mu, cov)
+        assert perf["annual_volatility_pct"] >= 0
+        assert len(perf["risk_contribution_pct"]) == 3
+
+
+def test_optimize_weights_rejects_unknown_method():
+    with pytest.raises(ValueError):
+        optimize_weights("magic", [0.1, 0.2], np.eye(2))

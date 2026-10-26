@@ -285,6 +285,31 @@ export interface StabilityPayload {
   end: string
 }
 
+export interface OptimizeWeightsPayload {
+  success: boolean
+  method: 'equal' | 'risk_parity' | 'min_variance' | 'max_sharpe'
+  vt_symbols: string[]
+  sample_days: number
+  start: string
+  end: string
+  weights: { vt_symbol: string; weight: number }[]
+  stats: {
+    annual_return_pct: number
+    annual_volatility_pct: number
+    sharpe_ratio: number
+    diversification_ratio: number
+    risk_contribution_pct: number[]
+  }
+  equal_weight_stats: {
+    annual_return_pct: number
+    annual_volatility_pct: number
+    sharpe_ratio: number
+    diversification_ratio: number
+    risk_contribution_pct: number[]
+  }
+  caveat: string
+}
+
 /** 因子有效性（IC / IR） */
 export interface FactorIcPayload {
   success: boolean
@@ -641,8 +666,21 @@ export function runStability(body: {
   capital?: number
   neighbor_ratio?: number
   fixed_params?: Record<string, number>
+  /** 复用 grid 已算好的分数，避免重复回测 */
+  precomputed_scores?: (number | null)[]
 }): Promise<StabilityPayload> {
   return post('/analytics/stability', body)
+}
+
+export function optimizeWeights(body: {
+  vt_symbols: string[]
+  method?: 'equal' | 'risk_parity' | 'min_variance' | 'max_sharpe'
+  start?: string
+  end?: string
+  lookback_days?: number
+  risk_free?: number
+}): Promise<OptimizeWeightsPayload> {
+  return post('/analytics/optimize', body)
 }
 
 export async function runFactorIc(body: {

@@ -24,10 +24,14 @@ from pydantic import BaseModel, Field
 from examples.cta_backtesting.run_rewritten_strategy_backtest import (
     DEFAULT_CONFIG,
     build_setting,
-    load_strategy_class,
+    load_stop_aware_strategy_class as load_strategy_class,
     main as _run_backtest_main,
 )
 from examples.cta_backtesting.monte_carlo import monte_carlo_summary
+from examples.cta_backtesting.portfolio_optimizer import (
+    optimize_weights,
+    portfolio_performance,
+)
 from examples.cta_backtesting.risk_metrics import (
     RiskLimits,
     compute_risk_metrics,
@@ -865,6 +869,91 @@ def combine_sleeve_returns(
         else:
             out.append(sum(float(weights.get(s, 0.0)) * srets.get(d, 0.0) for s, srets in date_rets.items()))
     return all_dates, out
+
+
+# ---- 组合权重优化（风险平价 / 最小方差 / 最大夏普） ----
+
+
+class OptimizeRequest(BaseModel):
+    vt_symbols: list[str] = Field(..., description="组合标的列表，2-10 个")
+    method: str = Field(
+        "risk_parity",
+        description="equal / risk_parity / min_variance / max_sharpe",
+    )
+    start: str = "2024-01-01"
+    end: str | None = None
+    lookback_days: int = Field(252, ge=60, le=1200, description="用于估计收益/协方差的交易日数")
+    risk_free: float = Field(0.02, ge=0.0, le=0.2, description="年化无风险利率")
+
+
+@router.post("/optimize")
+def optimize_portfolio(body: OptimizeRequest):
+    """基于历史日收益估计 mu / cov，给出 long-only 最优权重。
+
+    重要：权重由**回看窗口的历史数据**估计，存在样本内偏差，
+    不能直接当作未来最优配置；建议作为组合回测的起点，再用 walk-forward 验证。
+    """
+    symbols = [str(s).strip() for s in body.vt_symbols if str(s).strip()][:10]
+    if len(symbols) < 2:
+        raise HTTPException(status_code=400, detail="组合至少需要 2 个标的")
+    if body.method not in ("equal", "risk_parity", "min_variance", "max_sharpe"):
+        raise HTTPException(
+            status_code=400,
+            detail="method 仅支持 equal / risk_parity / min_variance / max_sharpe",
+        )
+
+    end = body.end or date.today().isoformat()
+    end_d = pd.Timestamp(end)
+    # 多取一些日历日以覆盖 lookback_days 个交易日
+    start_d = (end_d - pd.Timedelta(days=int(body.lookback_days * 1.7))).strftime("%Y-%m-%d")
+
+    frames = []
+    for sym in symbols:
+        df = _load_daily_df(sym, start_d, end_d.strftime("%Y-%m-%d"))
+        if df is None or df.empty:
+            continue
+        one = df[["trade_date", "close"]].copy()
+        one = one.rename(columns={"close": sym}).set_index("trade_date")
+        frames.append(one)
+
+    if len(frames) < 2:
+        raise HTTPException(status_code=502, detail=f"仅 {len(frames)} 个标的有行情数据，无法优化")
+
+    panel = pd.concat(frames, axis=1).sort_index().dropna()
+    if len(panel) < 60:
+        raise HTTPException(status_code=502, detail=f"对齐后仅 {len(panel)} 个交易日，至少需要 60 天")
+
+    panel = panel.tail(body.lookback_days)
+    rets = panel.pct_change().dropna()
+    if len(rets) < 40:
+        raise HTTPException(status_code=502, detail=f"有效收益样本仅 {len(rets)} 天，过少")
+
+    mu = rets.mean().to_numpy() * 252.0
+    cov = rets.cov().to_numpy() * 252.0
+    weights = optimize_weights(body.method, mu, cov, risk_free=body.risk_free)
+    perf = portfolio_performance(weights, mu, cov, risk_free=body.risk_free)
+
+    equal_w = optimize_weights("equal", mu, cov)
+    equal_perf = portfolio_performance(equal_w, mu, cov, risk_free=body.risk_free)
+
+    return {
+        "success": True,
+        "method": body.method,
+        "vt_symbols": list(panel.columns),
+        "sample_days": len(rets),
+        "start": str(panel.index[0]),
+        "end": str(panel.index[-1]),
+        "weights": [
+            {"vt_symbol": sym, "weight": round(float(w), 6)}
+            for sym, w in zip(panel.columns, weights)
+        ],
+        "stats": perf,
+        "equal_weight_stats": equal_perf,
+        "caveat": (
+            "权重由回看窗口的历史收益/协方差估计，存在样本内偏差；"
+            "不代表未来最优配置。建议作为组合回测起点，并用前向验证复核。"
+        ),
+    }
 
 
 @router.post("/portfolio")

@@ -2,14 +2,16 @@
 import { computed, onMounted, ref } from 'vue'
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
-import { Briefcase, Play, Loader2, Plus, Trash2, X } from 'lucide-vue-next'
+import { Briefcase, Play, Loader2, Plus, Trash2, X, Wand2 } from 'lucide-vue-next'
 import { listStrategies, type StrategyListItem } from '../services/backtest'
 import {
   cancelJob,
+  optimizeWeights,
   pollJob,
   runPortfolio,
   submitPortfolioJob,
   type JobInfo,
+  type OptimizeWeightsPayload,
   type PortfolioPayload,
 } from '../services/analytics'
 import { defaultChartEndDate, defaultChartStartDate } from '../services/market'
@@ -29,6 +31,45 @@ const stage = ref('')
 const data = ref<PortfolioPayload | null>(null)
 let stopPoll: (() => void) | null = null
 const activeJobId = ref('')
+
+// ---- 权重优化 ----
+const optimizeMethod = ref<'risk_parity' | 'min_variance' | 'max_sharpe' | 'equal'>('risk_parity')
+const optimizing = ref(false)
+const optimizeErr = ref('')
+const optimizeResult = ref<OptimizeWeightsPayload | null>(null)
+
+async function applyOptimizedWeights() {
+  const syms = symbols.value.map((s) => s.trim()).filter(Boolean)
+  if (syms.length < 2) {
+    optimizeErr.value = '至少需要 2 个标的'
+    return
+  }
+  optimizing.value = true
+  optimizeErr.value = ''
+  optimizeResult.value = null
+  try {
+    const res = await optimizeWeights({
+      vt_symbols: syms,
+      method: optimizeMethod.value,
+      start: start.value,
+      end: end.value,
+      lookback_days: 252,
+    })
+    const map = new Map(res.weights.map((w) => [w.vt_symbol, w.weight]))
+    const next = symbols.value.map((s) => map.get(s.trim()) ?? 0)
+    const sum = next.reduce((a, b) => a + b, 0)
+    if (sum <= 0) {
+      optimizeErr.value = '优化结果没有可用权重（可能部分标的无行情）'
+      return
+    }
+    weights.value = next.map((w) => w / sum)
+    optimizeResult.value = res
+  } catch (e) {
+    optimizeErr.value = e instanceof Error ? e.message : '权重优化失败'
+  } finally {
+    optimizing.value = false
+  }
+}
 
 function addSymbol() {
   if (symbols.value.length >= 10) return
@@ -265,6 +306,34 @@ onMounted(async () => {
           <button type="button" class="btn" @click="rebalanceWeights">等权重重置</button>
           <span class="w-sum">权重合计：{{ (weightSum() * 100).toFixed(0) }}%</span>
         </div>
+        <div class="opt-row">
+          <span class="opt-label">权重优化</span>
+          <select v-model="optimizeMethod" class="opt-select">
+            <option value="risk_parity">风险平价</option>
+            <option value="min_variance">最小方差</option>
+            <option value="max_sharpe">最大夏普</option>
+            <option value="equal">等权</option>
+          </select>
+          <button type="button" class="btn" :disabled="optimizing" @click="applyOptimizedWeights">
+            <Loader2 v-if="optimizing" class="ic spin" />
+            <Wand2 v-else class="ic" />
+            {{ optimizing ? '计算中...' : '按历史数据计算权重' }}
+          </button>
+          <span class="opt-hint">基于最近 252 日收益/协方差，long-only</span>
+        </div>
+        <p v-if="optimizeErr" class="err">{{ optimizeErr }}</p>
+        <div v-if="optimizeResult" class="opt-result">
+          <span>
+            优化组合：年化 {{ optimizeResult.stats.annual_return_pct.toFixed(2) }}% ·
+            波动 {{ optimizeResult.stats.annual_volatility_pct.toFixed(2) }}% ·
+            夏普 {{ optimizeResult.stats.sharpe_ratio.toFixed(2) }}
+          </span>
+          <span class="opt-compare">
+            等权对照：波动 {{ optimizeResult.equal_weight_stats.annual_volatility_pct.toFixed(2) }}% ·
+            夏普 {{ optimizeResult.equal_weight_stats.sharpe_ratio.toFixed(2) }}
+          </span>
+          <span class="opt-caveat">{{ optimizeResult.caveat }}</span>
+        </div>
       </div>
       <p v-if="err" class="err">{{ err }}</p>
       <p v-else-if="data" class="ok">{{ data.message }}</p>
@@ -377,4 +446,36 @@ onMounted(async () => {
   .tbl { font-size: .74rem; }
   .tbl th, .tbl td { padding: .35rem .4rem; }
 }
+
+.opt-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+  margin-top: .7rem;
+  padding-top: .7rem;
+  border-top: 1px dashed rgba(255,255,255,.08);
+}
+.opt-label { font-size: .78rem; color: var(--bq-muted); }
+.opt-select {
+  border: 1px solid rgba(255,255,255,.14);
+  border-radius: .5rem;
+  padding: .42rem .5rem;
+  background: rgba(8,12,21,.7);
+  color: var(--bq-text);
+}
+.opt-hint { font-size: .72rem; color: var(--bq-muted); }
+.opt-result {
+  display: grid;
+  gap: .25rem;
+  margin-top: .6rem;
+  padding: .6rem .7rem;
+  border-left: 3px solid #5aa9ff;
+  background: rgba(90,169,255,.06);
+  border-radius: .4rem;
+  font-size: .78rem;
+  color: #c3d2e8;
+}
+.opt-compare { color: #8b9bb4; }
+.opt-caveat { color: #6f7f94; font-size: .72rem; line-height: 1.5; }
 </style>

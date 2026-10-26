@@ -166,6 +166,10 @@ class StabilityRequest(BaseModel):
     capital: int = 10_000
     neighbor_ratio: float = Field(0.6, ge=0.1, le=2.0, description="孤立尖峰判定阈值")
     fixed_params: dict[str, float] | None = None
+    # 直接复用 /analytics/grid 已算出的分数，避免为每个参数点重跑一次回测
+    precomputed_scores: list[float] | None = Field(
+        None, description="与 values 一一对应的分数；提供则跳过回测（长度必须一致）"
+    )
 
 
 @router.post("/stability")
@@ -173,35 +177,46 @@ def param_stability(body: StabilityRequest):
     """参数曲面平滑度分析：最优参数是否孤立尖峰。
 
     与 /analytics/grid 的分工：grid 给「哪个参数最好」，
-    本接口给「这个最好能不能信」。建议先用 grid 扫描，
-    再把 cells 的 value/score 喂给本接口。
+    本接口给「这个最好能不能信」。
+
+    优先使用 `precomputed_scores`（前端从 grid 结果直接传 cells 的分数），
+    省掉每参数点一次回测；没传则自己跑。
     """
     if len(body.values) < 3:
         raise HTTPException(status_code=400, detail="至少需要 3 个参数点才能评估稳定性")
     if body.objective not in ("sharpe", "total_return", "calmar"):
         raise HTTPException(status_code=400, detail="objective 仅支持 sharpe / total_return / calmar")
 
+    scores: list[float | None]
     end = body.end or date.today().isoformat()
     sid = body.strategy_id.zfill(2)
-    cfg_base: dict[str, Any] = {"vt_symbol": body.vt_symbol, "capital": body.capital}
-    if body.fixed_params:
-        cfg_base.update(body.fixed_params)
-
-    scores: list[float] = []
-    for v in body.values:
-        p = (int(v) if float(v).is_integer() else v)
-        try:
-            cell = _cell_shape(
-                analytics._run_backtest(
-                    sid,
-                    {**cfg_base, "start": body.start, "end": end, body.param_name: p},
-                    include_monte_carlo=False,
-                )
+    if body.precomputed_scores is not None:
+        if len(body.precomputed_scores) != len(body.values):
+            raise HTTPException(
+                status_code=400,
+                detail=f"precomputed_scores 长度 {len(body.precomputed_scores)} 与 values {len(body.values)} 不一致",
             )
-        except Exception as exc:
-            logger.warning("stability 回测失败 %s=%s: %r", body.param_name, p, exc)
-            cell = {"ok": False}
-        scores.append(_objective_value(cell, body.objective))
+        scores = [float(s) if isinstance(s, (int, float)) else None for s in body.precomputed_scores]
+    else:
+        cfg_base: dict[str, Any] = {"vt_symbol": body.vt_symbol, "capital": body.capital}
+        if body.fixed_params:
+            cfg_base.update(body.fixed_params)
+
+        scores = []
+        for v in body.values:
+            p = (int(v) if float(v).is_integer() else v)
+            try:
+                cell = _cell_shape(
+                    analytics._run_backtest(
+                        sid,
+                        {**cfg_base, "start": body.start, "end": end, body.param_name: p},
+                        include_monte_carlo=False,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("stability 回测失败 %s=%s: %r", body.param_name, p, exc)
+                cell = {"ok": False}
+            scores.append(_objective_value(cell, body.objective))
 
     out = parameter_stability(
         body.values, scores, objective=body.objective, neighbor_ratio=body.neighbor_ratio

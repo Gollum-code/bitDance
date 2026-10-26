@@ -2,9 +2,9 @@
 import { computed, onMounted, ref } from 'vue'
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
-import { Grid3x3, Play, Loader2, X } from 'lucide-vue-next'
+import { Grid3x3, Play, Loader2, X, ShieldCheck } from 'lucide-vue-next'
 import { listStrategies, type StrategyListItem } from '../services/backtest'
-import { pollJob, runGrid, submitGridJob, cancelJob, type GridPayload, type JobInfo } from '../services/analytics'
+import { pollJob, runGrid, submitGridJob, cancelJob, runStability, type GridPayload, type JobInfo, type StabilityPayload } from '../services/analytics'
 import { defaultChartEndDate, defaultChartStartDate } from '../services/market'
 
 const strategies = ref<StrategyListItem[]>([])
@@ -27,22 +27,38 @@ const data = ref<GridPayload | null>(null)
 let stopPoll: (() => void) | null = null
 let activeJobId = ref('')
 
-const paramCandidates = ['fast_window', 'slow_window', 'signal_window', 'atr_window', 'atr_mult', 'fixed_size']
+const paramCandidates = [
+  'fast_window',
+  'slow_window',
+  'signal_window',
+  'atr_window',
+  'atr_mult',
+  'fixed_size',
+  // 止损维度：0 = 关闭，可扫描「均线窗口 × 止损幅度」看止损是否真有价值
+  'stop_loss_pct',
+  'take_profit_pct',
+  'trailing_stop_pct',
+]
+const STOP_PARAMS = new Set(['stop_loss_pct', 'take_profit_pct', 'trailing_stop_pct'])
 
-function parseValues(text: string): number[] {
+const stability = ref<StabilityPayload | null>(null)
+const stabilityLoading = ref(false)
+const stabilityErr = ref('')
+
+function parseValues(text: string, allowZero = false): number[] {
   return text
     .split(/[,，\s]+/)
     .map((s) => Number(s.trim()))
-    .filter((n) => !Number.isNaN(n) && n > 0)
+    .filter((n) => !Number.isNaN(n) && (allowZero ? n >= 0 : n > 0))
 }
 
 async function run() {
-  const values = parseValues(valuesText.value)
+  const values = parseValues(valuesText.value, STOP_PARAMS.has(paramName.value))
   if (values.length < 2) {
-    err.value = '至少输入 2 个参数取值（逗号分隔）'
+    err.value = '至少输入 2 个参数取值（逗号分隔；止损参数可含 0）'
     return
   }
-  const v2 = parseValues(values2Text.value)
+  const v2 = parseValues(values2Text.value, use2D.value && STOP_PARAMS.has(param2.value))
   if (use2D.value && v2.length < 2) {
     err.value = '双因子模式第二维至少需要 2 个取值'
     return
@@ -107,6 +123,37 @@ function cancel() {
   progress.value = 0
   stage.value = ''
   activeJobId.value = ''
+}
+
+async function checkStability() {
+  const payload = data.value
+  if (!payload || payload.mode === '2d' || !payload.cells?.length) return
+  const objective = (payload.objective ?? 'sharpe') as 'sharpe' | 'total_return'
+  const picks = payload.cells.filter((c) => c.ok)
+  if (picks.length < 3) {
+    stabilityErr.value = '有效参数点少于 3 个，无法评估稳定性'
+    return
+  }
+  stabilityLoading.value = true
+  stabilityErr.value = ''
+  stability.value = null
+  try {
+    stability.value = await runStability({
+      strategy_id: sid.value,
+      param_name: paramName.value,
+      values: picks.map((c) => c.value),
+      objective,
+      // 复用已扫出的分数，不再重复跑回测
+      precomputed_scores: picks.map((c) => (objective === 'total_return' ? c.total_return ?? null : c.sharpe ?? null)),
+      vt_symbol: payload.vt_symbol,
+      start: payload.start,
+      end: payload.end,
+    })
+  } catch (e) {
+    stabilityErr.value = e instanceof Error ? e.message : '稳定性检测失败'
+  } finally {
+    stabilityLoading.value = false
+  }
 }
 
 const heatOption = computed(() => {
@@ -185,6 +232,13 @@ function barW(v: number | null | undefined) {
     1,
   )
   return Math.max(2, Math.min(100, (Math.abs(v) / maxAbs) * 100))
+}
+
+function stabWidth(score: number): string {
+  const vals = stability.value?.curve?.map((p) => p.score) ?? []
+  const maxAbs = Math.max(...vals.map((v) => Math.abs(v)), 1e-9)
+  const pct = Math.max(2, Math.min(100, (Math.abs(score) / maxAbs) * 100))
+  return `${pct}%`
 }
 
 onMounted(async () => {
@@ -335,6 +389,42 @@ onMounted(async () => {
           </table>
         </div>
       </section>
+
+      <section v-if="data.mode !== '2d'" class="panel">
+        <h2 class="h2">参数稳定性 / 过拟合检测</h2>
+        <p class="hint">
+          直接复用上面已扫描的分数，不重跑回测：看最优参数是「平滑过渡」还是「孤立尖峰」。
+          孤立尖峰说明最优值大概率命中了样本噪声。
+        </p>
+        <button class="btn primary" :disabled="stabilityLoading" @click="checkStability">
+          <Loader2 v-if="stabilityLoading" class="ic spin" />
+          <ShieldCheck v-else class="ic" />
+          {{ stabilityLoading ? '检测中...' : '检测参数稳定性' }}
+        </button>
+        <p v-if="stabilityErr" class="err">{{ stabilityErr }}</p>
+
+        <div v-if="stability?.ok" class="stability">
+          <div class="stab-head">
+            <span class="stab-badge" :class="stability.isolated_peak ? 'bad' : 'ok'">
+              {{ stability.isolated_peak ? '孤立尖峰 · 过拟合风险高' : '参数曲面平滑' }}
+            </span>
+            <span class="stab-meta">
+              最优 {{ stability.param_name }} = {{ stability.best_param }} · 最优分 {{ fmt(stability.best_score, 4) }} ·
+              邻居均值 {{ fmt(stability.neighbor_avg, 4) }} · 平滑度 {{ fmt(stability.smoothness, 3) }}
+            </span>
+          </div>
+          <p class="stab-verdict">{{ stability.verdict }}</p>
+          <div class="stab-curve">
+            <div v-for="p in stability.curve ?? []" :key="p.param" class="stab-point">
+              <span class="sp-param">{{ p.param }}</span>
+              <div class="sp-track">
+                <div class="sp-bar" :style="{ width: stabWidth(p.score) }" :class="{ peak: p.param === stability.best_param }" />
+              </div>
+              <span class="sp-score">{{ fmt(p.score, 4) }}</span>
+            </div>
+          </div>
+        </div>
+      </section>
     </template>
   </div>
 </template>
@@ -390,4 +480,19 @@ onMounted(async () => {
   .tbl { font-size: .74rem; }
   .tbl th, .tbl td { padding: .35rem .4rem; }
 }
+
+.stability { margin-top: .9rem; }
+.stab-head { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+.stab-badge { padding: .2rem .6rem; border-radius: 999px; font-size: .72rem; font-weight: 600; }
+.stab-badge.ok { background: rgba(34,197,94,.14); color: #4ade80; }
+.stab-badge.bad { background: rgba(248,113,113,.14); color: #f87171; }
+.stab-meta { color: var(--bq-muted); font-size: .74rem; }
+.stab-verdict { margin: .6rem 0; padding: .55rem .7rem; border-left: 3px solid #5aa9ff; background: rgba(90,169,255,.07); color: #c3d2e8; font-size: .8rem; line-height: 1.65; }
+.stab-curve { display: grid; gap: .3rem; }
+.stab-point { display: grid; grid-template-columns: 70px 1fr 70px; gap: .5rem; align-items: center; font-size: .75rem; }
+.sp-param { text-align: right; color: var(--bq-muted); }
+.sp-track { height: 10px; border-radius: 999px; background: rgba(255,255,255,.06); overflow: hidden; }
+.sp-bar { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #2563eb, #22d3ee); }
+.sp-bar.peak { background: linear-gradient(90deg, #f59e0b, #f87171); }
+.sp-score { color: var(--bq-text); text-align: right; font-variant-numeric: tabular-nums; }
 </style>
